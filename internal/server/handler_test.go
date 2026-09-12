@@ -630,8 +630,10 @@ func TestModelsDynamic(t *testing.T) {
 	var resp map[string]any
 	json.Unmarshal(rec.Body.Bytes(), &resp)
 	data := resp["data"].([]any)
-	if len(data) != 3 {
-		t.Fatalf("want 3 dynamic models, got %d: %v", len(data), data)
+	// 动态模型 ∪ INTL 静态表（国际版模型端点不可用，需静态补全，故总数 = 3 + len(staticModelsIntl)）。
+	wantLen := 3 + len(staticModelsIntl)
+	if len(data) != wantLen {
+		t.Fatalf("want %d models (3 dynamic + %d intl static), got %d", wantLen, len(staticModelsIntl), len(data))
 	}
 	ids := map[string]bool{}
 	for _, m := range data {
@@ -639,6 +641,10 @@ func TestModelsDynamic(t *testing.T) {
 	}
 	if !ids["dyn-model-a"] || !ids["glm-9.9"] {
 		t.Errorf("dynamic ids missing: %v", ids)
+	}
+	// INTL 静态模型应与动态表合并出现（供客户端看到 GPT/Claude/Gemini 系列）。
+	if !ids["gpt-5.6-sol"] {
+		t.Errorf("intl static model gpt-5.6-sol missing from merged list")
 	}
 
 	// 断言字段映射：maxInputTokens → context_length，maxOutputTokens → max_output_tokens
@@ -1066,5 +1072,112 @@ func TestStatusRequiresAuth(t *testing.T) {
 	h.ServeHTTP(rec, httptest.NewRequest("GET", "/healthz", nil))
 	if rec.Code != 200 {
 		t.Errorf("healthz: code=%d", rec.Code)
+	}
+}
+
+// TestModelRealmPreferClassification 验证模型→账号域偏好的分类逻辑。
+func TestModelRealmPreferClassification(t *testing.T) {
+	intl := &auth.Auth{UID: "i", Domain: "www.codebuddy.ai"}
+	cn := &auth.Auth{UID: "c", Domain: "copilot.tencent.com"}
+
+	cases := []struct {
+		model    string
+		wantIntl bool // prefer 是否接受国际账号
+		wantCN   bool // prefer 是否接受国内账号
+	}{
+		// 国际专属 → 只接受国际
+		{"gpt-5.6-sol", true, false},
+		{"claude-opus-5", true, false},
+		{"gemini-3.1-pro", true, false},
+		// 国内专属 → 只接受国内
+		{"deepseek-v4-pro", false, true},
+		{"glm-5.3-flash", false, true},
+		// 共有/未知 → 优先国内
+		{"deepseek-v4.1-flash", false, true},
+		{"glm-5.2", false, true},
+		{"some-unknown-model", false, true},
+	}
+	for _, c := range cases {
+		prefer := modelRealmPrefer(c.model)
+		if prefer == nil {
+			t.Errorf("model %q: prefer should not be nil", c.model)
+			continue
+		}
+		if got := prefer(intl); got != c.wantIntl {
+			t.Errorf("model %q: prefer(intl)=%v want %v", c.model, got, c.wantIntl)
+		}
+		if got := prefer(cn); got != c.wantCN {
+			t.Errorf("model %q: prefer(cn)=%v want %v", c.model, got, c.wantCN)
+		}
+	}
+	if modelRealmPrefer("") != nil {
+		t.Error("empty model should return nil prefer (no restriction)")
+	}
+}
+
+// TestChatRoutesIntlModelToIntlAccount 验证国际专属模型直接选中国际账号，不先撞国内号。
+func TestChatRoutesIntlModelToIntlAccount(t *testing.T) {
+	var hits []string
+	up := newFakeUpstream(t, func(authz string) (int, string, bool) {
+		hits = append(hits, authz)
+		return 200, sseOK, true
+	})
+	p := testPoolWith(
+		&auth.Auth{UID: "cn-1", AccessToken: "at-cn", Domain: "copilot.tencent.com", ExpiresAt: 9999999999},
+		&auth.Auth{UID: "intl-1", AccessToken: "at-intl", Domain: "www.codebuddy.ai", ExpiresAt: 9999999999},
+	)
+	h := NewHandler(Config{Pool: p, Upstream: up})
+	req := httptest.NewRequest("POST", "/v1/chat/completions",
+		strings.NewReader(`{"model":"gpt-5.6-sol","messages":[{"role":"user","content":"hi"}]}`))
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	if rec.Code != 200 {
+		t.Fatalf("code=%d body=%s", rec.Code, rec.Body)
+	}
+	if len(hits) != 1 {
+		t.Fatalf("want exactly 1 upstream call (no wasted attempt), got %d: %v", len(hits), hits)
+	}
+	if hits[0] != "Bearer at-intl" {
+		t.Errorf("intl-only model should go straight to intl account, got %s", hits[0])
+	}
+}
+
+// TestChatPrefersCNAccountForSharedModel 验证共有模型优先走国内账号。
+func TestChatPrefersCNAccountForSharedModel(t *testing.T) {
+	var hits []string
+	up := newFakeUpstream(t, func(authz string) (int, string, bool) {
+		hits = append(hits, authz)
+		return 200, sseOK, true
+	})
+	p := testPoolWith(
+		&auth.Auth{UID: "cn-1", AccessToken: "at-cn", Domain: "copilot.tencent.com", ExpiresAt: 9999999999},
+		&auth.Auth{UID: "intl-1", AccessToken: "at-intl", Domain: "www.codebuddy.ai", ExpiresAt: 9999999999},
+	)
+	h := NewHandler(Config{Pool: p, Upstream: up})
+	req := httptest.NewRequest("POST", "/v1/chat/completions",
+		strings.NewReader(`{"model":"deepseek-v4.1-flash","messages":[{"role":"user","content":"hi"}]}`))
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	if rec.Code != 200 {
+		t.Fatalf("code=%d body=%s", rec.Code, rec.Body)
+	}
+	if len(hits) != 1 || hits[0] != "Bearer at-cn" {
+		t.Errorf("shared model should prefer CN account, got %v", hits)
+	}
+}
+
+// TestChatIntlModelFallsBackWhenNoIntlAccount 无国际账号时，国际模型仍可回落（不返回 503）。
+func TestChatIntlModelFallsBackWhenNoIntlAccount(t *testing.T) {
+	up := newFakeUpstream(t, func(authz string) (int, string, bool) {
+		return 200, sseOK, true
+	})
+	p := testPoolWith(&auth.Auth{UID: "cn-1", AccessToken: "at-cn", Domain: "copilot.tencent.com", ExpiresAt: 9999999999})
+	h := NewHandler(Config{Pool: p, Upstream: up})
+	req := httptest.NewRequest("POST", "/v1/chat/completions",
+		strings.NewReader(`{"model":"gpt-5.6-sol","messages":[{"role":"user","content":"hi"}]}`))
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	if rec.Code != 200 {
+		t.Fatalf("should fall back to available account, code=%d body=%s", rec.Code, rec.Body)
 	}
 }

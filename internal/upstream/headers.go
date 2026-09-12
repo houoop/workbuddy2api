@@ -9,11 +9,15 @@ import (
 )
 
 const (
-	clientUA        = "CLI/2.63.2 CodeBuddy/2.63.2"
-	originRefererCN = "https://www.codebuddy.cn"
+	clientUA          = "CLI/2.63.2 CodeBuddy/2.63.2"
+	originRefererCN   = "https://www.codebuddy.cn"
+	originRefererIntl = "https://www.codebuddy.ai"
 )
 
 func originRefererFor(a *auth.Auth) string {
+	if isIntl(a) {
+		return originRefererIntl
+	}
 	return originRefererCN
 }
 

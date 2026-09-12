@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
-# login.sh — WorkBuddy CN OAuth 登录 → 落盘 auth 文件
+# login.sh — WorkBuddy CN/INTL OAuth 登录 → 落盘 auth 文件
 #
 # 用法:
-#   ./login.sh
+#   ./login.sh          # 国内版（copilot.tencent.com / codebuddy.cn）
+#   ./login.sh -intl    # 国际版（www.codebuddy.ai，Gmail 等海外账号）
 #
 # 流程:
 #   1. POST /v2/plugin/auth/state 拿授权 URL（无 PKCE，state 由服务端签发）
@@ -14,6 +15,10 @@ set -euo pipefail
 cd "$(dirname "$0")"
 AUTH_DIR="./auths"
 CONTAINER="workbuddy2api"
+REALM="cn"
+if [[ "${1:-}" == "-intl" ]]; then
+    REALM="intl"
+fi
 
 mkdir -p "$AUTH_DIR"
 
@@ -23,12 +28,22 @@ if [[ ! -x "$LOGIN_BIN" ]]; then
     go build -o "$LOGIN_BIN" ./cmd/login
 fi
 
-echo "============================================================"
-echo "  WorkBuddy OAuth 登录"
-echo "============================================================"
+if [[ "$REALM" == "intl" ]]; then
+    echo "============================================================"
+    echo "  WorkBuddy OAuth 登录（国际版 www.codebuddy.ai）"
+    echo "============================================================"
+else
+    echo "============================================================"
+    echo "  WorkBuddy OAuth 登录"
+    echo "============================================================"
+fi
 echo ""
 
-AUTH_URL=$("$LOGIN_BIN" url)
+if [[ "$REALM" == "intl" ]]; then
+    AUTH_URL=$("$LOGIN_BIN" -intl url)
+else
+    AUTH_URL=$("$LOGIN_BIN" url)
+fi
 
 echo "请在浏览器中打开以下链接完成登录："
 echo ""
@@ -51,13 +66,23 @@ fi
 echo ""
 echo "正在获取 token..."
 
-RESULT=$("$LOGIN_BIN" poll) || {
-    echo ""
-    echo "获取 token 失败。可能原因："
-    echo "  - 登录还没完成就按了 y（重新运行 ./login.sh 再试）"
-    echo "  - 登录页报错（把报错截图发出来排查）"
-    exit 1
-}
+if [[ "$REALM" == "intl" ]]; then
+    RESULT=$("$LOGIN_BIN" -intl poll) || {
+        echo ""
+        echo "获取 token 失败。可能原因："
+        echo "  - 登录还没完成就按了 y（重新运行 ./login.sh -intl 再试）"
+        echo "  - 登录页报错（把报错截图发出来排查）"
+        exit 1
+    }
+else
+    RESULT=$("$LOGIN_BIN" poll) || {
+        echo ""
+        echo "获取 token 失败。可能原因："
+        echo "  - 登录还没完成就按了 y（重新运行 ./login.sh 再试）"
+        echo "  - 登录页报错（把报错截图发出来排查）"
+        exit 1
+    }
+fi
 
 TOKEN=$(echo "$RESULT" | python3 -c "import json,sys; print(json.load(sys.stdin)['access_token'])")
 REFRESH=$(echo "$RESULT" | python3 -c "import json,sys; print(json.load(sys.stdin)['refresh_token'])")
@@ -74,12 +99,18 @@ fi
 
 EXPIRES_AT=$(( $(date +%s) + EXPIRES_IN ))
 
-# ─── 签到（CN：POST codebuddy.cn/v2/billing/meter/daily-checkin，幂等不阻塞）───
+# ─── 签到（CN：POST codebuddy.cn/v2/billing/meter/daily-checkin，幂等不阻塞；
+#      INTL：POST www.codebuddy.ai 同路径，若国际版无此活动会报错，忽略即可）───
+if [[ "$REALM" == "intl" ]]; then
+    CHECKIN_URL="https://www.codebuddy.ai/v2/billing/meter/daily-checkin"
+else
+    CHECKIN_URL="https://www.codebuddy.cn/v2/billing/meter/daily-checkin"
+fi
 python3 - <<PYEOF
 import json, urllib.request, urllib.error
 
 req = urllib.request.Request(
-    "https://www.codebuddy.cn/v2/billing/meter/daily-checkin",
+    "$CHECKIN_URL",
     method="POST", data=b"{}",
     headers={
         "Authorization": "Bearer $TOKEN",

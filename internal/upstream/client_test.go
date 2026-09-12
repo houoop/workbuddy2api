@@ -26,6 +26,12 @@ func TestClassify(t *testing.T) {
 		{403, `insufficient credits`, ErrHardCredit},
 		{200, `{"code":10001,"msg":"积分不足，请充值"}`, ErrHardCredit},
 		{400, `{"code":1,"msg":"额度用尽"}`, ErrHardCredit},
+		// 实测（2026-09）：国内版额度耗尽返回 429 + code=14018 + "额度已用尽…"。
+		// 429 若无文案应判软冷却，但计费耗尽文案优先级更高 → 必须归 hard_credit，
+		// 否则耗尽账号短暂软冷却后又进候选池，每次请求白撞一次 429。
+		{429, `{"error":{"data":{"code":14018,"msg":"额度已用尽，请访问以下链接，购买加量包以获取更多额度：https://www.codebuddy.cn/profile/usage ","requestId":"3739835b-3d2c-42c8-98cf-176"}}}`, ErrHardCredit},
+		{400, `{"code":14018,"msg":"额度已耗尽"}`, ErrHardCredit},
+		{200, `{"code":14018}`, ErrHardCredit},
 		{429, ``, ErrSoftRate},
 		// 限流文案（issue #28）：状态码不是 429 时也必须识别为软限流，
 		// 否则账号不会被冷却，下次请求仍会被选中。

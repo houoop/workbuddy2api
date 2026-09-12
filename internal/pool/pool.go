@@ -470,7 +470,18 @@ func (p *Pool) Pick() *auth.Auth {
 // 挑选策略：healthy 账号中按三因子权重取前 5 名，再在 Top5 内按同一权重加权随机抽签，
 // 意图是打散热点，避免永远打同一个账号。
 func (p *Pool) PickExcluding(tried map[string]bool) *auth.Auth {
-	return p.pick(tried)
+	return p.pick(tried, nil)
+}
+
+// PickPrefer 优先在 prefer 选中的账号中挑选；prefer 无可用候选时回落到全池。
+// 用于"模型感知路由"：如国际版专属模型优先选国际账号，避免先撞国内账号吃 400 再换号。
+// prefer 返回 true 表示该账号属于首选集合；nil 表示不做偏好（等价 PickExcluding）。
+// 保底原则：偏好集合无 healthy 候选时不做限制，走原有逻辑，绝不因路由策略导致请求失败。
+func (p *Pool) PickPrefer(tried map[string]bool, prefer func(*auth.Auth) bool) *auth.Auth {
+	if prefer == nil {
+		return p.pick(tried, nil)
+	}
+	return p.pick(tried, prefer)
 }
 
 // pick 在 healthy 候选集中按三因子权重加权随机选出账号，并记录 lastUsed（防并发撞号）。
@@ -479,28 +490,46 @@ func (p *Pool) PickExcluding(tried map[string]bool) *auth.Auth {
 // 并发防雪崩：跳过 lastUsed 距今 < minPickGap 的账号（除非 top5 全部刚被用过，
 // 此时退回最近最少使用 LRU 账号），迫使高并发请求发散，而不是全部撞同一高分账号。
 // minPickGap=0（测试用）时过滤恒通过，退化为纯加权随机。
-func (p *Pool) pick(tried map[string]bool) *auth.Auth {
+func (p *Pool) pick(tried map[string]bool, prefer func(*auth.Auth) bool) *auth.Auth {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	now := time.Now()
 
-	var cands []*entry
-	for uid, e := range p.byUID {
-		if tried != nil && tried[uid] {
-			continue
+	collect := func(applyPrefer bool) []*entry {
+		var cands []*entry
+		for uid, e := range p.byUID {
+			if tried != nil && tried[uid] {
+				continue
+			}
+			if !e.healthy(now) {
+				continue
+			}
+			if p.inFlightFull(e) {
+				continue // 在途占满：跳过（max=0 不限时不触发）
+			}
+			if applyPrefer && prefer != nil && !prefer(e.a) {
+				continue
+			}
+			cands = append(cands, e)
 		}
-		if !e.healthy(now) {
-			continue
+		return cands
+	}
+
+	cands := collect(prefer != nil)
+	if len(cands) == 0 && prefer != nil {
+		// 偏好集合无可用候选（如国际账号全冷却）→ 放宽限制走全池，保证可用性。
+		// 仅当放宽后确有候选才记日志：两者皆空是 tried/健康度所致，与偏好无关，不该误报。
+		if relaxed := collect(false); len(relaxed) > 0 {
+			log.Printf("pool: prefer_set_empty, falling back to full pool")
+			cands = relaxed
 		}
-		if p.inFlightFull(e) {
-			continue // 在途占满：跳过（max=0 不限时不触发）
-		}
-		cands = append(cands, e)
 	}
 	if len(cands) == 0 {
 		// 全冷却兜底：无 healthy 候选时，从冷却账号里选 until 最早到期的一个
 		// （熔断/冷却共用 expiry 口径，取较早截止者）。禁用的账号永不参与兜底。
-		return p.pickEarliestExpiryLocked(tried, now)
+		// 同一份 prefer 传入：兜底也应尽量留在同域（如国际专属模型撞国内冷却号必 400），
+		// 仅在偏好集合内确无候选时才放宽到全池。
+		return p.pickEarliestExpiryLocked(tried, now, prefer)
 	}
 	// top5 短名单按三因子权重降序截断（而非 credits 单纯降序）：否则闲置补偿 + 成功率
 	// 根本进不了短名单决策，低 credits 但高成功率/久置的账号会永远排不进 top5。
@@ -560,28 +589,42 @@ func (p *Pool) pick(tried map[string]bool) *auth.Auth {
 // 分级：disabled 永不参与；CoolHard（余额耗尽，等签到的号）同样排除——调了必 402，浪费轮换并产生噪音日志；
 // CoolSoft 与熔断号允许参与（可能已恢复，失败成本仅一轮换）。
 // 被 tried 排除、在途占满的账号同样跳过（维持请求级轮换 + 租约语义）。无任何可用返回 nil。
-func (p *Pool) pickEarliestExpiryLocked(tried map[string]bool, now time.Time) *auth.Auth {
-	var best *entry
-	for uid, e := range p.byUID {
-		if tried != nil && tried[uid] {
-			continue
+// prefer 非 nil 时优先只在偏好集合内选（如国际专属模型只挑国际号）；集合内无候选才放宽到全池。
+func (p *Pool) pickEarliestExpiryLocked(tried map[string]bool, now time.Time, prefer func(*auth.Auth) bool) *auth.Auth {
+	// pickOne 在当前过滤条件下扫一遍，返回 until 最早到期的账号。
+	pickOne := func(applyPrefer bool) *entry {
+		var best *entry
+		for uid, e := range p.byUID {
+			if tried != nil && tried[uid] {
+				continue
+			}
+			if e.disabled {
+				continue // 禁用的账号永不参与兜底
+			}
+			if e.coolKind == CoolHard && !e.until.IsZero() && now.Before(e.until) {
+				continue // 余额耗尽号（处于有效 hard 冷却期）不参与兜底：等签到恢复，调了必 402
+			}
+			if p.inFlightFull(e) {
+				continue
+			}
+			if applyPrefer && prefer != nil && !prefer(e.a) {
+				continue
+			}
+			exp := e.expiry(now)
+			if exp.IsZero() {
+				continue
+			}
+			if best == nil || exp.Before(best.expiry(now)) {
+				best = e
+			}
 		}
-		if e.disabled {
-			continue // 禁用的账号永不参与兜底
-		}
-		if e.coolKind == CoolHard && !e.until.IsZero() && now.Before(e.until) {
-			continue // 余额耗尽号（处于有效 hard 冷却期）不参与兜底：等签到恢复，调了必 402
-		}
-		if p.inFlightFull(e) {
-			continue
-		}
-		exp := e.expiry(now)
-		if exp.IsZero() {
-			continue
-		}
-		if best == nil || exp.Before(best.expiry(now)) {
-			best = e
-		}
+		return best
+	}
+
+	best := pickOne(prefer != nil)
+	if best == nil && prefer != nil {
+		// 偏好域内无冷却候选 → 放宽到全池（宁可跨域试一次，也不直接 503）。
+		best = pickOne(false)
 	}
 	if best == nil {
 		return nil

@@ -17,7 +17,17 @@ func PrepareBodyOpt(src []byte, sanitize bool) []byte {
 // PrepareBodyOptWithEfforts 在 PrepareBodyOpt 基础上按模型 supportedEfforts 降级 reasoning_effort：
 // 仅当请求显式携带且模型不支持该档位时，改为 ≤请求档位的最高支持档；支持档全部高于请求档时取最低档；
 // 未知模型/未知档位/未携带该字段一律透传。efforts 为 nil 表示未知（不降级）。
+//
+// 不注入 system prompt（国内版无需）；国际版请用 PrepareBodyRealm 并传 intl=true。
 func PrepareBodyOptWithEfforts(src []byte, sanitize bool, efforts map[string][]string) []byte {
+	return PrepareBodyRealm(src, sanitize, efforts, false)
+}
+
+// PrepareBodyRealm 是全量改写入口：在 PrepareBodyOptWithEfforts 之上增加
+// 「按账号域决定是否补全 system prompt」——国际版（www.codebuddy.ai）强制要求
+// messages 首条 role=system，否则 400 code=11128；国内版无此要求，保持原样不动
+// （不改变既有 CN 请求形状，避免无谓 token 开销与行为漂移）。
+func PrepareBodyRealm(src []byte, sanitize bool, efforts map[string][]string, intl bool) []byte {
 	if len(src) == 0 {
 		return src
 	}
@@ -28,6 +38,9 @@ func PrepareBodyOptWithEfforts(src []byte, sanitize bool, efforts map[string][]s
 	obj["stream"] = true
 	normalizeToolChoice(obj)
 	normalizeRoles(obj)
+	if intl {
+		normalizeSystemPrompt(obj)
+	}
 	normalizeReasoningEffort(obj, efforts)
 	if sanitize {
 		if msgs, ok := obj["messages"].([]any); ok {
@@ -106,6 +119,39 @@ func normalizeReasoningEffort(obj map[string]any, efforts map[string][]string) {
 		log.Printf("reasoning_effort floored model=%s %s -> %s", model, reqStr, lowest)
 	}
 }
+
+// normalizeSystemPrompt 保证 messages 首条为 system：国际版（www.codebuddy.ai）强制要求
+// 首条消息 role=system，否则拒绝并返回 400 code=11128 "first message is not system prompt"。
+//
+// 处理规则（宁少改不多改）：
+//   - 首条已是 system（含 developer 经 normalizeRoles 归一后的）→ 原样保留，不插入
+//   - messages 缺失/空/非数组 → 不处理（让上游报它自己的参数错误）
+//   - 其余情况 → 在最前面插入一条默认 system 消息
+//
+// 默认文案中性、不含任何产品约束；对国内账号无副作用（国内版接受 system），
+// 因此无需按账号域区分。
+func normalizeSystemPrompt(obj map[string]any) {
+	msgs, ok := obj["messages"].([]any)
+	if !ok || len(msgs) == 0 {
+		return
+	}
+	if msg, ok := msgs[0].(map[string]any); ok {
+		if role, _ := msg["role"].(string); strings.EqualFold(strings.TrimSpace(role), "system") {
+			return // 已有前置 system，尊重调用方
+		}
+	}
+	prefixed := make([]any, 0, len(msgs)+1)
+	prefixed = append(prefixed, map[string]any{
+		"role":    "system",
+		"content": defaultSystemPrompt,
+	})
+	prefixed = append(prefixed, msgs...)
+	obj["messages"] = prefixed
+	log.Printf("system prompt injected (upstream requires system-first)")
+}
+
+// defaultSystemPrompt 自动补全用的中性 system 文案。
+const defaultSystemPrompt = "You are a helpful assistant."
 
 // normalizeRoles 把 messages 里的 developer 角色归一为 system。
 //

@@ -126,7 +126,7 @@ func (h *Handler) status(w http.ResponseWriter, r *http.Request) {
 }
 
 // 静态 CN 模型表（api-reference §5，动态接口失败时的回退）。
-var staticModels = []map[string]any{
+var staticModelsCN = []map[string]any{
 	{"id": "glm-5.2", "object": "model", "created": 1753600000, "owned_by": "workbuddy", "context_length": 131072},
 	{"id": "glm-5.1", "object": "model", "created": 1753600000, "owned_by": "workbuddy", "context_length": 131072},
 	{"id": "glm-5v-turbo", "object": "model", "created": 1753600000, "owned_by": "workbuddy", "context_length": 131072},
@@ -137,6 +137,114 @@ var staticModels = []map[string]any{
 	{"id": "hy3-preview-agent", "object": "model", "created": 1753600000, "owned_by": "workbuddy", "context_length": 131072},
 	{"id": "deepseek-v4-pro", "object": "model", "created": 1753600000, "owned_by": "workbuddy", "context_length": 131072},
 	{"id": "deepseek-v4-flash", "object": "model", "created": 1753600000, "owned_by": "workbuddy", "context_length": 131072},
+}
+
+// 静态 INTL 模型表（www.codebuddy.ai）。
+// 国际版 /console/enterprises/personal/models 恒 500，动态拉取不可用，故静态维护。
+// 清单经实测（2026-09 逐个探测）确认可用；context_length 为保守兜底值。
+var staticModelsIntl = []map[string]any{
+	// OpenAI 系列
+	{"id": "gpt-5.6-sol", "object": "model", "created": 1753600000, "owned_by": "workbuddy", "context_length": 131072},
+	{"id": "gpt-5.6-terra", "object": "model", "created": 1753600000, "owned_by": "workbuddy", "context_length": 131072},
+	{"id": "gpt-5.6-luna", "object": "model", "created": 1753600000, "owned_by": "workbuddy", "context_length": 131072},
+	{"id": "gpt-5.5", "object": "model", "created": 1753600000, "owned_by": "workbuddy", "context_length": 131072},
+	{"id": "gpt-5.4", "object": "model", "created": 1753600000, "owned_by": "workbuddy", "context_length": 131072},
+	{"id": "gpt-5.3-codex", "object": "model", "created": 1753600000, "owned_by": "workbuddy", "context_length": 131072},
+	{"id": "gpt-6-astra", "object": "model", "created": 1753600000, "owned_by": "workbuddy", "context_length": 131072},
+	// Anthropic 系列
+	{"id": "claude-opus-5", "object": "model", "created": 1753600000, "owned_by": "workbuddy", "context_length": 131072},
+	{"id": "claude-opus-4.6", "object": "model", "created": 1753600000, "owned_by": "workbuddy", "context_length": 131072},
+	{"id": "claude-sonnet-4.6", "object": "model", "created": 1753600000, "owned_by": "workbuddy", "context_length": 131072},
+	// Google 系列
+	{"id": "gemini-3.1-pro", "object": "model", "created": 1753600000, "owned_by": "workbuddy", "context_length": 131072},
+	{"id": "gemini-3.5-flash", "object": "model", "created": 1753600000, "owned_by": "workbuddy", "context_length": 131072},
+	{"id": "gemini-3.8-flash", "object": "model", "created": 1753600000, "owned_by": "workbuddy", "context_length": 131072},
+	// 国产（国际版可见但 CN 静态表未覆盖的）
+	{"id": "auto", "object": "model", "created": 1753600000, "owned_by": "workbuddy", "context_length": 131072},
+	{"id": "hy4-preview", "object": "model", "created": 1753600000, "owned_by": "workbuddy", "context_length": 131072},
+	{"id": "deepseek-v3", "object": "model", "created": 1753600000, "owned_by": "workbuddy", "context_length": 131072},
+	{"id": "deepseek-v4.1-flash", "object": "model", "created": 1753600000, "owned_by": "workbuddy", "context_length": 131072},
+	{"id": "glm-5.3", "object": "model", "created": 1753600000, "owned_by": "workbuddy", "context_length": 131072},
+	{"id": "kimi-k3", "object": "model", "created": 1753600000, "owned_by": "workbuddy", "context_length": 131072},
+	{"id": "kimi-k2.6", "object": "model", "created": 1753600000, "owned_by": "workbuddy", "context_length": 131072},
+	{"id": "kimi-k2.5", "object": "model", "created": 1753600000, "owned_by": "workbuddy", "context_length": 131072},
+}
+
+// mergeModelTables 合并多张模型表并按 id 去重（先出现者优先）。
+func mergeModelTables(tables ...[]map[string]any) []map[string]any {
+	seen := make(map[string]struct{})
+	out := make([]map[string]any, 0, 32)
+	for _, t := range tables {
+		for _, m := range t {
+			id, _ := m["id"].(string)
+			if id == "" {
+				continue
+			}
+			if _, dup := seen[id]; dup {
+				continue
+			}
+			seen[id] = struct{}{}
+			out = append(out, m)
+		}
+	}
+	return out
+}
+
+// staticModelsAll 全部静态模型（CN ∪ INTL，去重）。
+var staticModelsAll = mergeModelTables(staticModelsCN, staticModelsIntl)
+
+// intlOnlyModels 仅国际版可用的模型集合（国内账号请求会吃 400 "not available for authorized users"）。
+// 用于模型感知路由：命中即优先选国际账号，避免先撞国内号再换号的无谓往返。
+var intlOnlyModels = func() map[string]struct{} {
+	m := make(map[string]struct{})
+	for _, id := range []string{
+		"gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna", "gpt-5.5", "gpt-5.4",
+		"gpt-5.3-codex", "gpt-6-astra",
+		"claude-opus-5", "claude-opus-4.6", "claude-sonnet-4.6",
+		"gemini-3.1-pro", "gemini-3.5-flash", "gemini-3.8-flash",
+		"deepseek-v3", "kimi-k3", "kimi-k2.5",
+	} {
+		m[id] = struct{}{}
+	}
+	return m
+}()
+
+// cnOnlyModels 仅国内版可用的模型集合（国际账号请求会吃 "service info not found"）。
+var cnOnlyModels = func() map[string]struct{} {
+	m := make(map[string]struct{})
+	for _, id := range []string{
+		"deepseek-v4-pro", "deepseek-v4-flash",
+		"glm-5.3-flash", "kimi-k3-1", "hy3-x",
+		"hy3-preview", "hy3-preview-agent",
+	} {
+		m[id] = struct{}{}
+	}
+	return m
+}()
+
+// modelRealmPrefer 按请求模型返回账号偏好过滤函数，实现模型感知路由。
+//
+//	仅国际模型 → 只选国际账号
+//	仅国内模型 → 只选国内账号
+//	共有/未知模型 → 优先国内账号（省代理流量、延迟更低）
+//
+// 返回 nil 表示不做限制（全池随机，走原有三因子加权逻辑）。
+// 注：实际可用性由 pool 侧兜底——偏好集合无 healthy 候选时自动放宽到全池。
+func modelRealmPrefer(model string) func(*auth.Auth) bool {
+	if model == "" {
+		return nil
+	}
+	_, intlOnly := intlOnlyModels[model]
+	_, cnOnly := cnOnlyModels[model]
+	switch {
+	case intlOnly:
+		return upstream.IsIntl
+	case cnOnly:
+		return func(a *auth.Auth) bool { return !upstream.IsIntl(a) }
+	default:
+		// 共有或未收录模型：优先国内账号。
+		return func(a *auth.Auth) bool { return !upstream.IsIntl(a) }
+	}
 }
 
 // dynamicModelsCache 动态模型缓存。
@@ -161,9 +269,11 @@ func (h *Handler) models(w http.ResponseWriter, r *http.Request) {
 }
 
 // modelList 动态获取模型列表并包装成 OpenAI 格式（含 context_length）。
+// 动态拉取成功 → 动态表 ∪ INTL 静态表（国际版模型端点不可用，需静态补全）；
+// 动态拉取失败 → CN ∪ INTL 静态表，保证 /v1/models 始终反映可用模型。
 func (h *Handler) modelList() []map[string]any {
 	if infos := h.fetchDynamicModels(); len(infos) > 0 {
-		out := make([]map[string]any, 0, len(infos))
+		out := make([]map[string]any, 0, len(infos)+len(staticModelsIntl))
 		for _, mi := range infos {
 			entry := map[string]any{
 				"id":                mi.ID,
@@ -178,9 +288,9 @@ func (h *Handler) modelList() []map[string]any {
 			}
 			out = append(out, entry)
 		}
-		return out
+		return mergeModelTables(out, staticModelsIntl)
 	}
-	return staticModels
+	return staticModelsAll
 }
 
 // fetchDynamicModels 从池中任一健康账号拉模型列表（含 contextWindow/maxTokens），缓存 1h。
@@ -199,14 +309,19 @@ func (h *Handler) fetchDynamicModels() []upstream.ModelInfo {
 	}
 	dynamicModelsCache.RUnlock()
 
-	acct := h.cfg.Pool.Pick()
+	// 模型列表端点仅国内版可用（国际版 /console/enterprises/personal/models 恒 500），
+	// 故此处偏好国内账号；全为国际版时才回落（pool 侧自动放宽）。
+	acct := h.cfg.Pool.PickPrefer(nil, func(a *auth.Auth) bool { return !upstream.IsIntl(a) })
 	if acct == nil {
 		return nil
 	}
+	// 国际版账号的 models 端点不可用，失败不惩罚该账号（非账号问题，避免误喂熔断计数）。
+	intlAcct := upstream.IsIntl(acct)
 	infos, err := h.cfg.Upstream.FetchModels(acct)
 	if err != nil || len(infos) == 0 {
-		// 拉取失败惩罚该账号，避免下次 Pick 又选中同一个反复失败；lastFail 保持全局负缓存。
-		h.cfg.Pool.NoteError(acct.UID)
+		if !intlAcct {
+			h.cfg.Pool.NoteError(acct.UID)
+		}
 		dynamicModelsCache.Lock()
 		dynamicModelsCache.lastFail = time.Now()
 		dynamicModelsCache.Unlock()
@@ -272,11 +387,24 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	// 模型感知路由：按请求模型决定账号偏好（国际专属模型 → 国际号；共有/国内模型 → 国内号）。
+	// pool 侧兜底：偏好集合无 healthy 候选时自动放宽到全池，故此处只影响优先级，不影响可用性。
+	reqModel := parseModelFromBody(body)
+	realmPrefer := modelRealmPrefer(reqModel)
+
 	for i := 0; i < h.cfg.MaxRotate; i++ {
 		// 选号：粘性号优先（PickByUID 已校验 health + 在途未满），否则普通轮换。
 		var acct *auth.Auth
 		if stickyUID != "" {
 			acct = h.cfg.Pool.PickByUID(stickyUID)
+			if acct != nil && realmPrefer != nil && !realmPrefer(acct) {
+				// 粘性号与本次请求的模型域不匹配（如国际专属模型绑到了国内号）：
+				// 释放并解绑，改走带偏好的轮换，避免必失败的一次往返。
+				h.cfg.Pool.Release(acct.UID)
+				h.cfg.Session.Unbind(sessKey)
+				stickyUID = ""
+				acct = nil
+			}
 			if acct == nil {
 				// 粘性号当前不可用（冷却/占满）→ 解绑，本次回落普通轮换。
 				h.cfg.Session.Unbind(sessKey)
@@ -284,7 +412,7 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 		if acct == nil {
-			acct = h.cfg.Pool.PickExcluding(tried)
+			acct = h.cfg.Pool.PickPrefer(tried, realmPrefer)
 		}
 		if acct == nil {
 			st.status = http.StatusServiceUnavailable

@@ -17,6 +17,9 @@ import (
 	"workbuddy2api/internal/auth"
 )
 
+// intlBaseDefault 国际版（www.codebuddy.ai）默认域名，chat 与 billing 同域。
+const intlBaseDefault = "https://www.codebuddy.ai"
+
 // ErrKind 错误分类，pool 据此决定冷却时长。
 type ErrKind int
 
@@ -61,11 +64,23 @@ func (e *Error) Error() string {
 }
 
 // hardMarkers 余额不足关键词（小写比较 + 中文原文比较双通道）。
+//
+// 实测（2026-09）：国内版额度耗尽时返回 **HTTP 429** + body code=14018
+// "额度已用尽，请访问以下链接，购买加量包以获取更多额度"。
+// 该文案含「已」字，早期词表的 "额度用尽" 子串匹配不到，导致被误判为 soft_rate
+// （短冷却），耗尽账号短暂恢复后又进候选池，每次请求都撞一次 429 并污染轮换。
+// 故此处覆盖「已/未/无」等插入字，并显式收录上游业务码 14018。
 var hardMarkers = []string{
 	"insufficient credit", "no credit", "credit exhausted", "out of credit",
 	"quota exceeded", "quota exhaust", "payment required", "credit not enough",
 	"not enough credit",
 	"积分不足", "额度不足", "余额不足", "积分用完", "额度用尽", "没有积分",
+	// 实测文案变体：额度已用尽 / 额度已耗尽 / 额度已用完 等
+	"额度已用尽", "额度已耗尽", "额度已用完", "额度耗尽", "额度用完",
+	"积分已用尽", "积分已耗尽", "余额已用尽",
+	// 上游业务码 14018 = 额度已用尽。用带引号的 JSON 形态精确匹配，
+	// 避免裸子串 "14018" 误伤 requestId/时间戳等偶含该数字的字段。
+	`"code":14018`, `"code": 14018`,
 }
 
 // softRateMarkers 限流/节流关键词（小写比较 + 中文原文比较双通道）。
@@ -170,6 +185,9 @@ type Client struct {
 
 	ChatBaseCN    string
 	BillingBaseCN string
+	// ChatBaseIntl / BillingBaseIntl 国际版（www.codebuddy.ai）域名，供 Gmail 等海外账号路由。
+	ChatBaseIntl    string
+	BillingBaseIntl string
 }
 
 // New 生产默认值。配置连接池减少 TLS 握手。
@@ -187,6 +205,8 @@ func New() *Client {
 		SanitizeFingerprints: true,
 		ChatBaseCN:           "https://copilot.tencent.com",
 		BillingBaseCN:        "https://www.codebuddy.cn",
+		ChatBaseIntl:         "https://www.codebuddy.ai",
+		BillingBaseIntl:      "https://www.codebuddy.ai",
 	}
 }
 
@@ -198,13 +218,34 @@ func (c *Client) chatHTTP() *http.Client {
 	return c.HTTP
 }
 
+// IsIntl 报告账号是否为国际版（www.codebuddy.ai），供 server 侧模型感知路由使用。
+func IsIntl(a *auth.Auth) bool { return isIntl(a) }
+
+// isIntl 判断账号是否为国际版（www.codebuddy.ai）。
+// 依据 auth 文件 domain 字段：国际版 OAuth 返回 "www.codebuddy.ai"（或其子域），
+// 国内版返回 "copilot.tencent.com"。兼容旧凭证无 domain 或未知值 → 按国内处理。
+func isIntl(a *auth.Auth) bool {
+	if a == nil {
+		return false
+	}
+	d := strings.ToLower(strings.TrimSpace(a.Domain))
+	return strings.Contains(d, "codebuddy.ai")
+}
+
 func (c *Client) chatBase(a *auth.Auth) string {
+	if isIntl(a) {
+		if c.ChatBaseIntl != "" {
+			return c.ChatBaseIntl
+		}
+		return intlBaseDefault
+	}
 	return c.ChatBaseCN
 }
 
 // prepareBody 组装出站请求体（脱敏开关由 Client.SanitizeFingerprints 控制）。
-func (c *Client) prepareBody(body []byte) []byte {
-	return PrepareBodyOptWithEfforts(body, c.SanitizeFingerprints, c.effortsSnapshot())
+// intl=true 时额外补全 system prompt（国际版强制首条为 system）。
+func (c *Client) prepareBody(body []byte, intl bool) []byte {
+	return PrepareBodyRealm(body, c.SanitizeFingerprints, c.effortsSnapshot(), intl)
 }
 
 // effortsSnapshot 返回 effort 能力缓存副本；nil 表示未知（透传不降级）。
@@ -222,6 +263,12 @@ func (c *Client) effortsSnapshot() map[string][]string {
 }
 
 func (c *Client) billingBase(a *auth.Auth) string {
+	if isIntl(a) {
+		if c.BillingBaseIntl != "" {
+			return c.BillingBaseIntl
+		}
+		return intlBaseDefault
+	}
 	return c.BillingBaseCN
 }
 
@@ -297,7 +344,7 @@ func (c *Client) RefreshToken(a *auth.Auth) error {
 // 只有传输层失败才返回 err。
 func (c *Client) ChatStream(a *auth.Auth, body []byte) (rc io.ReadCloser, status int, respBody []byte, err error) {
 	url := c.chatBase(a) + "/v2/chat/completions"
-	req, err := http.NewRequest(http.MethodPost, url, bytes.NewReader(c.prepareBody(body)))
+	req, err := http.NewRequest(http.MethodPost, url, bytes.NewReader(c.prepareBody(body, isIntl(a))))
 	if err != nil {
 		return nil, 0, nil, err
 	}

@@ -22,10 +22,12 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strings"
 	"time"
 )
 
 const billingBaseCN = "https://www.codebuddy.cn"
+const billingBaseIntl = "https://www.codebuddy.ai"
 
 type authFile struct {
 	Auth struct {
@@ -88,6 +90,14 @@ func packageRemainUsed(a resourcePackage) (remain, used, size int64) {
 	return remain, used, size
 }
 
+// billingBaseFor 按账号 domain 选择国内/国际版计费域名。
+func billingBaseFor(af *authFile) string {
+	if strings.Contains(strings.ToLower(af.Auth.Domain), "codebuddy.ai") {
+		return billingBaseIntl
+	}
+	return billingBaseCN
+}
+
 func fetchUserResource(af *authFile) (remain, used, size int64, packs int, err error) {
 	now := time.Now()
 	body, _ := json.Marshal(map[string]any{
@@ -98,7 +108,7 @@ func fetchUserResource(af *authFile) (remain, used, size int64, packs int, err e
 		"PackageEndTimeRangeBegin": now.Format("2006-01-02 15:04:05"),
 		"PackageEndTimeRangeEnd":   now.Add(365 * 101 * 24 * time.Hour).Format("2006-01-02 15:04:05"),
 	})
-	req, err := http.NewRequest(http.MethodPost, billingBaseCN+"/v2/billing/meter/get-user-resource", bytes.NewReader(body))
+	req, err := http.NewRequest(http.MethodPost, billingBaseFor(af)+"/v2/billing/meter/get-user-resource", bytes.NewReader(body))
 	if err != nil {
 		return 0, 0, 0, 0, err
 	}

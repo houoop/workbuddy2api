@@ -1,11 +1,6 @@
 # syntax=docker/dockerfile:1
-FROM golang:1.23-alpine AS build
-WORKDIR /src
-COPY go.mod ./
-RUN go mod download
-COPY . .
-RUN CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /out/wb2api ./cmd/server
-
+# 预编译产物镜像：二进制由外部（10.8.0.12 golang 容器）构建后放入 .build-dist/。
+# 使用：先在构建机编译出 .build-dist/wb2api，再 docker compose up -d --build。
 FROM alpine:3.20
 RUN apk add --no-cache wget ca-certificates tzdata \
  && adduser -D -u 10001 app \
@@ -13,7 +8,7 @@ RUN apk add --no-cache wget ca-certificates tzdata \
  && chown -R app:app /app
 USER app
 WORKDIR /app
-COPY --from=build /out/wb2api /app/wb2api
+COPY .build-dist/wb2api /app/wb2api
 COPY config.json /app/config.json
 EXPOSE 7863
 HEALTHCHECK --interval=30s --timeout=5s --start-period=5s \
