@@ -1646,3 +1646,98 @@ func TestStatusExposesRuntimeFields(t *testing.T) {
 	}
 	p.Release("u1")
 }
+
+// TestPickPreferFiltersRealm 验证模型感知路由：偏好集合非空时只在其中选号。
+func TestPickPreferFiltersRealm(t *testing.T) {
+	p := New("")
+	p.Add(&auth.Auth{UID: "cn-1", Domain: "copilot.tencent.com"})
+	p.Add(&auth.Auth{UID: "intl-1", Domain: "www.codebuddy.ai"})
+
+	// 只偏好国际账号 → 必须选到 intl-1（重复多次排除随机性）
+	for i := 0; i < 20; i++ {
+		a := p.PickPrefer(nil, func(x *auth.Auth) bool { return x.UID == "intl-1" })
+		if a == nil || a.UID != "intl-1" {
+			t.Fatalf("want intl-1, got %v", a)
+		}
+	}
+	// 只偏好国内账号 → 必须选到 cn-1
+	for i := 0; i < 20; i++ {
+		a := p.PickPrefer(nil, func(x *auth.Auth) bool { return x.UID == "cn-1" })
+		if a == nil || a.UID != "cn-1" {
+			t.Fatalf("want cn-1, got %v", a)
+		}
+	}
+}
+
+// TestPickPreferFallsBackWhenPreferEmpty 偏好集合无 healthy 候选时放宽到全池，不返回 nil。
+func TestPickPreferFallsBackWhenPreferEmpty(t *testing.T) {
+	p := New("")
+	p.Add(&auth.Auth{UID: "cn-1", Domain: "copilot.tencent.com"})
+	p.Add(&auth.Auth{UID: "intl-1", Domain: "www.codebuddy.ai"})
+	// 把唯一国际号冷却掉，偏好国际仍应回落到国内号（而不是失败）
+	p.Cooldown("intl-1", CoolSoft, time.Hour, "test")
+
+	a := p.PickPrefer(nil, func(x *auth.Auth) bool { return x.UID == "intl-1" })
+	if a == nil || a.UID != "cn-1" {
+		t.Fatalf("prefer-empty should fall back to cn-1, got %v", a)
+	}
+}
+
+// TestPickPreferNilBehavesLikePick nil 偏好等价原行为（全池候选）。
+func TestPickPreferNilBehavesLikePick(t *testing.T) {
+	p := New("")
+	p.Add(&auth.Auth{UID: "a"})
+	p.Add(&auth.Auth{UID: "b"})
+	seen := map[string]bool{}
+	for i := 0; i < 60; i++ {
+		a := p.PickPrefer(nil, nil)
+		if a == nil {
+			t.Fatal("nil prefer should never return nil with healthy accounts")
+		}
+		seen[a.UID] = true
+	}
+	if !seen["a"] || !seen["b"] {
+		t.Errorf("nil prefer should spread across pool: %v", seen)
+	}
+}
+
+// TestPickPreferRespectsTried 偏好集合内全部被 tried 排除时，放宽后仍应跳过 tried。
+func TestPickPreferRespectsTried(t *testing.T) {
+	p := New("")
+	p.Add(&auth.Auth{UID: "cn-1", Domain: "copilot.tencent.com"})
+	p.Add(&auth.Auth{UID: "intl-1", Domain: "www.codebuddy.ai"})
+	tried := map[string]bool{"intl-1": true}
+	a := p.PickPrefer(tried, func(x *auth.Auth) bool { return x.UID == "intl-1" })
+	if a == nil || a.UID != "cn-1" {
+		t.Fatalf("tried intl should fall back to cn-1, got %v", a)
+	}
+}
+
+// TestPickPreferAppliedInFallback 全冷却兜底时也应优先同域，避免跨域必失败的一次往返。
+func TestPickPreferAppliedInFallback(t *testing.T) {
+	p := New("")
+	p.Add(&auth.Auth{UID: "cn-1", Domain: "copilot.tencent.com"})
+	p.Add(&auth.Auth{UID: "intl-1", Domain: "www.codebuddy.ai"})
+	// 两号都软冷却（无 healthy），但国际号更早到期
+	p.Cooldown("cn-1", CoolSoft, 2*time.Hour, "test")
+	p.Cooldown("intl-1", CoolSoft, time.Minute, "test")
+
+	a := p.PickPrefer(nil, func(x *auth.Auth) bool { return x.UID == "intl-1" })
+	if a == nil || a.UID != "intl-1" {
+		t.Fatalf("fallback should respect prefer and pick intl-1, got %v", a)
+	}
+}
+
+// TestPickPreferFallbackRelaxesWhenPreferDomainExhausted 偏好域内无冷却候选时放宽到其他域。
+func TestPickPreferFallbackRelaxesWhenPreferDomainExhausted(t *testing.T) {
+	p := New("")
+	p.Add(&auth.Auth{UID: "cn-1", Domain: "copilot.tencent.com"})
+	p.Add(&auth.Auth{UID: "intl-1", Domain: "www.codebuddy.ai"})
+	p.Disable("intl-1", "test") // 国际号不可用
+	p.Cooldown("cn-1", CoolSoft, time.Hour, "test")
+
+	a := p.PickPrefer(nil, func(x *auth.Auth) bool { return x.UID == "intl-1" })
+	if a == nil || a.UID != "cn-1" {
+		t.Fatalf("should relax to cn-1 when prefer domain has no candidate, got %v", a)
+	}
+}
