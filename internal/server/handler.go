@@ -356,7 +356,7 @@ func (h *Handler) fetchDynamicModels() []upstream.ModelInfo {
 
 	// 模型列表端点仅国内版可用（国际版 /console/enterprises/personal/models 恒 500），
 	// 故此处偏好国内账号；全为国际版时才回落（pool 侧自动放宽）。
-	acct := h.cfg.Pool.PickPrefer(nil, func(a *auth.Auth) bool { return !upstream.IsIntl(a) })
+	acct := h.cfg.Pool.PickPrefer(nil, func(a *auth.Auth) bool { return !upstream.IsIntl(a) }, false)
 	if acct == nil {
 		return nil
 	}

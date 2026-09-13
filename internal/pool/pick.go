@@ -29,6 +29,21 @@ func (p *Pool) PickExcludingForModel(tried map[string]bool, reqModel string) *au
 	return p.pick(tried, reqModel)
 }
 
+// PickPrefer 优先在 prefer 选中的账号中挑选；prefer 无可用候选时回落到全池。
+// 用于"模型感知路由"：如国际版专属模型优先选国际账号，避免先撞国内账号吃 400 再换号。
+// prefer 返回 true 表示该账号属于首选集合；nil 表示不做偏好（等价 PickExcluding）。
+//
+// strict=true 表示"绝不越界"：偏好集合无 healthy 候选时不放宽到全池，直接返回 nil
+// （调用方据此回 503）。用于保护稀缺账号——例如国际号额度宝贵且延迟高，
+// 国产/混元模型（hy4-preview 等）宁可等服务也不要烧国际号额度。
+// strict=false 为"优先但不强求"：无候选时放宽到全池，最大化可用性。
+//
+// 实现上等价 PickExcludingForModelPrefer 传空模型：不带模型级冷却豁免口径，
+// 只叠加账号域偏好，故可直接复用同一套 pickRealm 逻辑。
+func (p *Pool) PickPrefer(tried map[string]bool, prefer func(*auth.Auth) bool, strict bool) *auth.Auth {
+	return p.PickExcludingForModelPrefer(tried, "", prefer, strict)
+}
+
 // PickExcludingForModelPrefer 在 PickExcludingForModel 之上叠加"账号域偏好"：
 // 用于模型感知路由——国际专属模型（gpt-*/claude-*/gemini-*）只挑国际号；
 // 国产模型（hy*/glm*/deepseek*/kimi*/minimax*）严格绑国内号，避免烧国际号额度。
