@@ -1081,24 +1081,30 @@ func TestModelRealmPreferClassification(t *testing.T) {
 	cn := &auth.Auth{UID: "c", Domain: "copilot.tencent.com"}
 
 	cases := []struct {
-		model    string
-		wantIntl bool // prefer 是否接受国际账号
-		wantCN   bool // prefer 是否接受国内账号
+		model      string
+		wantIntl   bool // prefer 是否接受国际账号
+		wantCN     bool // prefer 是否接受国内账号
+		wantStrict bool // 是否严格（无候选时不放宽）
 	}{
 		// 国际专属 → 只接受国际
-		{"gpt-5.6-sol", true, false},
-		{"claude-opus-5", true, false},
-		{"gemini-3.1-pro", true, false},
-		// 国内专属 → 只接受国内
-		{"deepseek-v4-pro", false, true},
-		{"glm-5.3-flash", false, true},
-		// 共有/未知 → 优先国内
-		{"deepseek-v4.1-flash", false, true},
-		{"glm-5.2", false, true},
-		{"some-unknown-model", false, true},
+		{"gpt-5.6-sol", true, false, false},
+		{"claude-opus-5", true, false, false},
+		{"gemini-3.1-pro", true, false, false},
+		// 严格国内（混元/国产，保护国际号额度）→ 只接受国内且 strict
+		{"hy4-preview", false, true, true},
+		{"hy3", false, true, true},
+		{"deepseek-v4.1-flash", false, true, true},
+		{"glm-5.2", false, true, true},
+		{"kimi-k2.7", false, true, true},
+		{"minimax-m3", false, true, true},
+		// 仅国内（非严格）→ 只接受国内，可放宽
+		{"deepseek-v4-pro", false, true, true}, // 也在 strict 清单内
+		{"glm-5.3-flash", false, true, true},   // 也在 strict 清单内
+		// 共有/未知 → 优先国内，可放宽
+		{"some-unknown-model", false, true, false},
 	}
 	for _, c := range cases {
-		prefer := modelRealmPrefer(c.model)
+		prefer, strict := modelRealmPrefer(c.model)
 		if prefer == nil {
 			t.Errorf("model %q: prefer should not be nil", c.model)
 			continue
@@ -1109,9 +1115,42 @@ func TestModelRealmPreferClassification(t *testing.T) {
 		if got := prefer(cn); got != c.wantCN {
 			t.Errorf("model %q: prefer(cn)=%v want %v", c.model, got, c.wantCN)
 		}
+		if strict != c.wantStrict {
+			t.Errorf("model %q: strict=%v want %v", c.model, strict, c.wantStrict)
+		}
 	}
-	if modelRealmPrefer("") != nil {
+	if prefer, _ := modelRealmPrefer(""); prefer != nil {
 		t.Error("empty model should return nil prefer (no restriction)")
+	}
+}
+
+// TestChatStrictCNModelNeverUsesIntlAccount 保护国际号：严格国内模型即使国内号冷却，
+// 也只走同域兜底（冷却中的国内号），绝不溢出到国际号烧额度
+// （实测国际号 TTFB 20-40s 且额度仅国内号 1/6）。
+func TestChatStrictCNModelNeverUsesIntlAccount(t *testing.T) {
+	var hits []string
+	up := newFakeUpstream(t, func(authz string) (int, string, bool) {
+		hits = append(hits, authz)
+		return 200, sseOK, true
+	})
+	p := testPoolWith(
+		&auth.Auth{UID: "cn-1", AccessToken: "at-cn", Domain: "copilot.tencent.com", ExpiresAt: 9999999999},
+		&auth.Auth{UID: "intl-1", AccessToken: "at-intl", Domain: "www.codebuddy.ai", ExpiresAt: 9999999999},
+	)
+	// 国内号软冷却：strict 应走同域兜底（c冷却中的 cn-1），而不是改用国际号
+	p.Cooldown("cn-1", pool.CoolSoft, time.Hour, "test")
+	h := NewHandler(Config{Pool: p, Upstream: up})
+	req := httptest.NewRequest("POST", "/v1/chat/completions",
+		strings.NewReader(`{"model":"hy4-preview","messages":[{"role":"user","content":"hi"}]}`))
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	for _, hz := range hits {
+		if hz == "Bearer at-intl" {
+			t.Fatalf("strict CN model must never use intl account, hits=%v", hits)
+		}
+	}
+	if rec.Code != 200 {
+		t.Errorf("want 200 via same-domain fallback, got %d body=%s", rec.Code, rec.Body)
 	}
 }
 

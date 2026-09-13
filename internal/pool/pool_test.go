@@ -1484,14 +1484,14 @@ func TestPickPreferFiltersRealm(t *testing.T) {
 
 	// 只偏好国际账号 → 必须选到 intl-1（重复多次排除随机性）
 	for i := 0; i < 20; i++ {
-		a := p.PickPrefer(nil, func(x *auth.Auth) bool { return x.UID == "intl-1" })
+		a := p.PickPrefer(nil, func(x *auth.Auth) bool { return x.UID == "intl-1" }, false)
 		if a == nil || a.UID != "intl-1" {
 			t.Fatalf("want intl-1, got %v", a)
 		}
 	}
 	// 只偏好国内账号 → 必须选到 cn-1
 	for i := 0; i < 20; i++ {
-		a := p.PickPrefer(nil, func(x *auth.Auth) bool { return x.UID == "cn-1" })
+		a := p.PickPrefer(nil, func(x *auth.Auth) bool { return x.UID == "cn-1" }, false)
 		if a == nil || a.UID != "cn-1" {
 			t.Fatalf("want cn-1, got %v", a)
 		}
@@ -1506,7 +1506,7 @@ func TestPickPreferFallsBackWhenPreferEmpty(t *testing.T) {
 	// 把唯一国际号冷却掉，偏好国际仍应回落到国内号（而不是失败）
 	p.Cooldown("intl-1", CoolSoft, time.Hour, "test")
 
-	a := p.PickPrefer(nil, func(x *auth.Auth) bool { return x.UID == "intl-1" })
+	a := p.PickPrefer(nil, func(x *auth.Auth) bool { return x.UID == "intl-1" }, false)
 	if a == nil || a.UID != "cn-1" {
 		t.Fatalf("prefer-empty should fall back to cn-1, got %v", a)
 	}
@@ -1519,7 +1519,7 @@ func TestPickPreferNilBehavesLikePick(t *testing.T) {
 	p.Add(&auth.Auth{UID: "b"})
 	seen := map[string]bool{}
 	for i := 0; i < 60; i++ {
-		a := p.PickPrefer(nil, nil)
+		a := p.PickPrefer(nil, nil, false)
 		if a == nil {
 			t.Fatal("nil prefer should never return nil with healthy accounts")
 		}
@@ -1536,7 +1536,7 @@ func TestPickPreferRespectsTried(t *testing.T) {
 	p.Add(&auth.Auth{UID: "cn-1", Domain: "copilot.tencent.com"})
 	p.Add(&auth.Auth{UID: "intl-1", Domain: "www.codebuddy.ai"})
 	tried := map[string]bool{"intl-1": true}
-	a := p.PickPrefer(tried, func(x *auth.Auth) bool { return x.UID == "intl-1" })
+	a := p.PickPrefer(tried, func(x *auth.Auth) bool { return x.UID == "intl-1" }, false)
 	if a == nil || a.UID != "cn-1" {
 		t.Fatalf("tried intl should fall back to cn-1, got %v", a)
 	}
@@ -1551,7 +1551,7 @@ func TestPickPreferAppliedInFallback(t *testing.T) {
 	p.Cooldown("cn-1", CoolSoft, 2*time.Hour, "test")
 	p.Cooldown("intl-1", CoolSoft, time.Minute, "test")
 
-	a := p.PickPrefer(nil, func(x *auth.Auth) bool { return x.UID == "intl-1" })
+	a := p.PickPrefer(nil, func(x *auth.Auth) bool { return x.UID == "intl-1" }, false)
 	if a == nil || a.UID != "intl-1" {
 		t.Fatalf("fallback should respect prefer and pick intl-1, got %v", a)
 	}
@@ -1565,8 +1565,59 @@ func TestPickPreferFallbackRelaxesWhenPreferDomainExhausted(t *testing.T) {
 	p.Disable("intl-1", "test") // 国际号不可用
 	p.Cooldown("cn-1", CoolSoft, time.Hour, "test")
 
-	a := p.PickPrefer(nil, func(x *auth.Auth) bool { return x.UID == "intl-1" })
+	a := p.PickPrefer(nil, func(x *auth.Auth) bool { return x.UID == "intl-1" }, false)
 	if a == nil || a.UID != "cn-1" {
 		t.Fatalf("should relax to cn-1 when prefer domain has no candidate, got %v", a)
+	}
+}
+
+// TestPickPreferStrictNeverCrossesBoundary strict 模式下偏好集合无候选时返回 nil（不越界烧稀缺账号）。
+func TestPickPreferStrictNeverCrossesBoundary(t *testing.T) {
+	p := New("")
+	p.Add(&auth.Auth{UID: "cn-1", Domain: "copilot.tencent.com"})
+	p.Add(&auth.Auth{UID: "intl-1", Domain: "www.codebuddy.ai"})
+	preferCN := func(x *auth.Auth) bool { return x.UID == "cn-1" }
+
+	// 国内号可用 → 正常选中
+	if a := p.PickPrefer(nil, preferCN, true); a == nil || a.UID != "cn-1" {
+		t.Fatalf("available CN should be picked, got %v", a)
+	}
+	// 国内号软冷却 → strict 仍优先同域兜底（选冷却中的国内号，不越界到国际号）
+	p.Cooldown("cn-1", CoolSoft, time.Hour, "test")
+	if a := p.PickPrefer(nil, preferCN, true); a == nil || a.UID != "cn-1" {
+		t.Fatalf("strict should stay in prefer domain (cooling CN), got %v", a)
+	}
+	// 国内号彻底禁用（永不参与兜底，含冷却兜底）→ strict 才返回 nil
+	p.Disable("cn-1", "test")
+	if a := p.PickPrefer(nil, preferCN, true); a != nil {
+		t.Fatalf("strict mode must not fall back to intl when CN disabled, got %v", a)
+	}
+	// 同一场景下非 strict 会放宽（对照，确认 strict 确有区别）
+	if a := p.PickPrefer(nil, preferCN, false); a == nil || a.UID != "intl-1" {
+		t.Fatalf("non-strict should fall back to intl-1, got %v", a)
+	}
+}
+
+// TestPickPreferStrictFallbackNeverCrossesDomain strict 模式下全冷却兜底也不得跨域。
+func TestPickPreferStrictFallbackNeverCrossesDomain(t *testing.T) {
+	p := New("")
+	p.Add(&auth.Auth{UID: "cn-1", Domain: "copilot.tencent.com"})
+	p.Add(&auth.Auth{UID: "intl-1", Domain: "www.codebuddy.ai"})
+	preferCN := func(x *auth.Auth) bool { return x.UID == "cn-1" }
+
+	// 国内号软冷却（可参与兜底）→ strict 应选它，不碰国际号
+	p.Cooldown("cn-1", CoolSoft, time.Hour, "test")
+	if a := p.PickPrefer(nil, preferCN, true); a == nil || a.UID != "cn-1" {
+		t.Fatalf("strict fallback should pick cooling CN, got %v", a)
+	}
+
+	// 国内号禁用（永不参与兜底）→ strict 必须返回 nil，不跨域到国际号
+	p.Disable("cn-1", "test")
+	if a := p.PickPrefer(nil, preferCN, true); a != nil {
+		t.Fatalf("strict must not cross to intl when CN disabled, got %s", a.UID)
+	}
+	// 对照：非 strict 会跨域兜底
+	if a := p.PickPrefer(nil, preferCN, false); a == nil || a.UID != "intl-1" {
+		t.Fatalf("non-strict should cross to intl, got %v", a)
 	}
 }

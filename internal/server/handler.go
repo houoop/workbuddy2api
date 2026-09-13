@@ -222,28 +222,54 @@ var cnOnlyModels = func() map[string]struct{} {
 	return m
 }()
 
+// cnStrictModels 严格绑定国内账号的模型集合：即使国内号全忙/冷却，也不允许溢出到国际号。
+//
+// 动机（实测 2026-09）：国际号额度稀缺（总额 380，约为国内号 1/6）且经代理延迟高
+// （TTFB 常达 20-40s，国内号仅 2-4s）。混元系（hy*）与国产模型本就是国内版主力，
+// 之前归在「共有→优先国内」，国内号冷却时会放宽到全池，把流量溢到国际号白烧额度。
+// 这些模型宁可等国内号，也不要烧国际号。
+var cnStrictModels = func() map[string]struct{} {
+	m := make(map[string]struct{})
+	for _, id := range []string{
+		"hy4-preview", "hy3", "hy3-x", "hy3-preview", "hy3-preview-agent",
+		"glm-5.3", "glm-5.2", "glm-5.1", "glm-5v-turbo", "glm-5.3-flash",
+		"deepseek-v4-pro", "deepseek-v4-flash", "deepseek-v4.1-flash",
+		"kimi-k3-1", "kimi-k2.7", "kimi-k2.6",
+		"minimax-m3",
+	} {
+		m[id] = struct{}{}
+	}
+	return m
+}()
+
 // modelRealmPrefer 按请求模型返回账号偏好过滤函数，实现模型感知路由。
 //
-//	仅国际模型 → 只选国际账号
-//	仅国内模型 → 只选国内账号
+//	仅国际模型 → 只选国际账号（strict=false：国际号不可用时可回落国内，虽会 400 但保留兜底）
+//	严格国内模型（国产/混元）→ 只选国内账号且 strict=true，绝不烧国际号额度
+//	仅国内模型 → 只选国内账号（strict=false）
 //	共有/未知模型 → 优先国内账号（省代理流量、延迟更低）
 //
-// 返回 nil 表示不做限制（全池随机，走原有三因子加权逻辑）。
-// 注：实际可用性由 pool 侧兜底——偏好集合无 healthy 候选时自动放宽到全池。
-func modelRealmPrefer(model string) func(*auth.Auth) bool {
+// 返回 (prefer, strict)。prefer 为 nil 表示不做限制（全池随机）。
+// strict=true 时 pool 不放宽到全池，无候选即返回 nil（调用方回 503）。
+// 注：非严格模式下的可用性由 pool 侧兜底——偏好集合无 healthy 候选时自动放宽到全池。
+func modelRealmPrefer(model string) (func(*auth.Auth) bool, bool) {
 	if model == "" {
-		return nil
+		return nil, false
 	}
+	notIntl := func(a *auth.Auth) bool { return !upstream.IsIntl(a) }
 	_, intlOnly := intlOnlyModels[model]
+	_, strictCN := cnStrictModels[model]
 	_, cnOnly := cnOnlyModels[model]
 	switch {
 	case intlOnly:
-		return upstream.IsIntl
+		return upstream.IsIntl, false
+	case strictCN:
+		return notIntl, true
 	case cnOnly:
-		return func(a *auth.Auth) bool { return !upstream.IsIntl(a) }
+		return notIntl, false
 	default:
-		// 共有或未收录模型：优先国内账号。
-		return func(a *auth.Auth) bool { return !upstream.IsIntl(a) }
+		// 共有或未收录模型：优先国内账号（可放宽）。
+		return notIntl, false
 	}
 }
 
@@ -311,7 +337,7 @@ func (h *Handler) fetchDynamicModels() []upstream.ModelInfo {
 
 	// 模型列表端点仅国内版可用（国际版 /console/enterprises/personal/models 恒 500），
 	// 故此处偏好国内账号；全为国际版时才回落（pool 侧自动放宽）。
-	acct := h.cfg.Pool.PickPrefer(nil, func(a *auth.Auth) bool { return !upstream.IsIntl(a) })
+	acct := h.cfg.Pool.PickPrefer(nil, func(a *auth.Auth) bool { return !upstream.IsIntl(a) }, false)
 	if acct == nil {
 		return nil
 	}
@@ -390,7 +416,7 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	// 模型感知路由：按请求模型决定账号偏好（国际专属模型 → 国际号；共有/国内模型 → 国内号）。
 	// pool 侧兜底：偏好集合无 healthy 候选时自动放宽到全池，故此处只影响优先级，不影响可用性。
 	reqModel := parseModelFromBody(body)
-	realmPrefer := modelRealmPrefer(reqModel)
+	realmPrefer, realmStrict := modelRealmPrefer(reqModel)
 
 	for i := 0; i < h.cfg.MaxRotate; i++ {
 		// 选号：粘性号优先（PickByUID 已校验 health + 在途未满），否则普通轮换。
@@ -412,7 +438,7 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 		if acct == nil {
-			acct = h.cfg.Pool.PickPrefer(tried, realmPrefer)
+			acct = h.cfg.Pool.PickPrefer(tried, realmPrefer, realmStrict)
 		}
 		if acct == nil {
 			st.status = http.StatusServiceUnavailable

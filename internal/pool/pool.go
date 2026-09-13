@@ -470,27 +470,42 @@ func (p *Pool) Pick() *auth.Auth {
 // 挑选策略：healthy 账号中按三因子权重取前 5 名，再在 Top5 内按同一权重加权随机抽签，
 // 意图是打散热点，避免永远打同一个账号。
 func (p *Pool) PickExcluding(tried map[string]bool) *auth.Auth {
-	return p.pick(tried, nil)
+	return p.PickPrefer(tried, nil, false)
 }
 
 // PickPrefer 优先在 prefer 选中的账号中挑选；prefer 无可用候选时回落到全池。
 // 用于"模型感知路由"：如国际版专属模型优先选国际账号，避免先撞国内账号吃 400 再换号。
 // prefer 返回 true 表示该账号属于首选集合；nil 表示不做偏好（等价 PickExcluding）。
-// 保底原则：偏好集合无 healthy 候选时不做限制，走原有逻辑，绝不因路由策略导致请求失败。
-func (p *Pool) PickPrefer(tried map[string]bool, prefer func(*auth.Auth) bool) *auth.Auth {
-	if prefer == nil {
-		return p.pick(tried, nil)
+//
+// strict=true 表示"绝不越界"：偏好集合无 healthy 候选时不放宽到全池，直接返回 nil
+// （调用方据此回 503）。用于保护稀缺账号——例如国际号额度宝贵且延迟高，
+// 国产/混元模型（hy4-preview 等）宁可等服务也不要烧国际号额度。
+// strict=false（默认）为"优先但不强求"：无候选时放宽到全池，最大化可用性。
+//
+// 保底原则：strict=false 时绝不因路由策略导致请求失败。
+func (p *Pool) PickPrefer(tried map[string]bool, prefer func(*auth.Auth) bool, strict bool) *auth.Auth {
+	cands, relaxed := p.pickCandidates(tried, prefer, strict)
+	if len(cands) == 0 {
+		if !relaxed && prefer != nil && !strict {
+			// 非严格模式：偏好集合空 → 放宽到全池，保证可用性。
+			log.Printf("pool: prefer_set_empty, falling back to full pool")
+			cands, _ = p.pickCandidates(tried, nil, false)
+		}
+		if len(cands) == 0 {
+			p.mu.Lock()
+			// 全冷却兜底：优先域内兜底（冷却中的同域账号），strict 时不跨域。
+			e := p.pickEarliestExpiryLocked(tried, time.Now(), prefer, strict)
+			p.mu.Unlock()
+			return e
+		}
 	}
-	return p.pick(tried, prefer)
+	return p.selectFrom(cands)
 }
 
-// pick 在 healthy 候选集中按三因子权重加权随机选出账号，并记录 lastUsed（防并发撞号）。
-// 候选集是 top5 近似：先按三因子权重（weightOf）降序取前 5（credits 只是权重的一个因子，
-// 闲置补偿与成功率同样决定谁进短名单），再在 top5 内做防撞号过滤。
-// 并发防雪崩：跳过 lastUsed 距今 < minPickGap 的账号（除非 top5 全部刚被用过，
-// 此时退回最近最少使用 LRU 账号），迫使高并发请求发散，而不是全部撞同一高分账号。
-// minPickGap=0（测试用）时过滤恒通过，退化为纯加权随机。
-func (p *Pool) pick(tried map[string]bool, prefer func(*auth.Auth) bool) *auth.Auth {
+// pickCandidates 收集 healthy 候选（持锁），返回候选集与 relaxed 标志。
+// relaxed=true 表示已因偏好集合为空而放宽到全池（供调用方决定是否记日志/回退）。
+// strict=true 时不做放宽：偏好集合空就返回空集（用于保护稀缺账号不越界）。
+func (p *Pool) pickCandidates(tried map[string]bool, prefer func(*auth.Auth) bool, strict bool) ([]*entry, bool) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	now := time.Now()
@@ -505,7 +520,7 @@ func (p *Pool) pick(tried map[string]bool, prefer func(*auth.Auth) bool) *auth.A
 				continue
 			}
 			if p.inFlightFull(e) {
-				continue // 在途占满：跳过（max=0 不限时不触发）
+				continue
 			}
 			if applyPrefer && prefer != nil && !prefer(e.a) {
 				continue
@@ -516,21 +531,20 @@ func (p *Pool) pick(tried map[string]bool, prefer func(*auth.Auth) bool) *auth.A
 	}
 
 	cands := collect(prefer != nil)
-	if len(cands) == 0 && prefer != nil {
-		// 偏好集合无可用候选（如国际账号全冷却）→ 放宽限制走全池，保证可用性。
-		// 仅当放宽后确有候选才记日志：两者皆空是 tried/健康度所致，与偏好无关，不该误报。
+	if len(cands) == 0 && prefer != nil && !strict {
 		if relaxed := collect(false); len(relaxed) > 0 {
-			log.Printf("pool: prefer_set_empty, falling back to full pool")
-			cands = relaxed
+			return relaxed, true
 		}
 	}
-	if len(cands) == 0 {
-		// 全冷却兜底：无 healthy 候选时，从冷却账号里选 until 最早到期的一个
-		// （熔断/冷却共用 expiry 口径，取较早截止者）。禁用的账号永不参与兜底。
-		// 同一份 prefer 传入：兜底也应尽量留在同域（如国际专属模型撞国内冷却号必 400），
-		// 仅在偏好集合内确无候选时才放宽到全池。
-		return p.pickEarliestExpiryLocked(tried, now, prefer)
-	}
+	return cands, false
+}
+
+// selectFrom 在已收集的候选集中按三因子权重选出账号（延用原 pick 的 top5+加权+LRU 逻辑）。
+func (p *Pool) selectFrom(cands []*entry) *auth.Auth {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	now := time.Now()
+
 	// top5 短名单按三因子权重降序截断（而非 credits 单纯降序）：否则闲置补偿 + 成功率
 	// 根本进不了短名单决策，低 credits 但高成功率/久置的账号会永远排不进 top5。
 	var maxCredits int64
@@ -589,8 +603,11 @@ func (p *Pool) pick(tried map[string]bool, prefer func(*auth.Auth) bool) *auth.A
 // 分级：disabled 永不参与；CoolHard（余额耗尽，等签到的号）同样排除——调了必 402，浪费轮换并产生噪音日志；
 // CoolSoft 与熔断号允许参与（可能已恢复，失败成本仅一轮换）。
 // 被 tried 排除、在途占满的账号同样跳过（维持请求级轮换 + 租约语义）。无任何可用返回 nil。
-// prefer 非 nil 时优先只在偏好集合内选（如国际专属模型只挑国际号）；集合内无候选才放宽到全池。
-func (p *Pool) pickEarliestExpiryLocked(tried map[string]bool, now time.Time, prefer func(*auth.Auth) bool) *auth.Auth {
+//
+// prefer 非 nil 时优先只在偏好集合内选（如国际专属模型只挑国际号）；
+// strict=true 时绝不跨域，偏好域内无候选即返回 nil（保护稀缺账号额度）；
+// strict=false 时域内无候选才放宽到全池（宁可跨域试一次，也不直接 503）。
+func (p *Pool) pickEarliestExpiryLocked(tried map[string]bool, now time.Time, prefer func(*auth.Auth) bool, strict bool) *auth.Auth {
 	// pickOne 在当前过滤条件下扫一遍，返回 until 最早到期的账号。
 	pickOne := func(applyPrefer bool) *entry {
 		var best *entry
@@ -622,8 +639,8 @@ func (p *Pool) pickEarliestExpiryLocked(tried map[string]bool, now time.Time, pr
 	}
 
 	best := pickOne(prefer != nil)
-	if best == nil && prefer != nil {
-		// 偏好域内无冷却候选 → 放宽到全池（宁可跨域试一次，也不直接 503）。
+	if best == nil && prefer != nil && !strict {
+		// 非严格：偏好域内无冷却候选 → 放宽到全池（宁可跨域试一次，也不直接 503）。
 		best = pickOne(false)
 	}
 	if best == nil {
