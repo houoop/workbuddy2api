@@ -6,15 +6,18 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
 	"net/http"
+	"regexp"
 	"strings"
 	"sync"
 	"time"
 
 	"workbuddy2api/internal/auth"
+	"workbuddy2api/internal/logfmt"
 )
 
 // intlBaseDefault 国际版（www.codebuddy.ai）默认域名，chat 与 billing 同域。
@@ -24,13 +27,15 @@ const intlBaseDefault = "https://www.codebuddy.ai"
 type ErrKind int
 
 const (
-	ErrNone        ErrKind = iota // 成功
-	ErrHardCredit                 // 余额不足（402 或 body 关键词）→ 长冷却
-	ErrSoftRate                   // 429 软限流 → 短冷却
-	ErrSessionDead                // 401 + 12153 offline session 失效 → 禁用
-	ErrNotFound                   // 404 上游偶发 → 短冷却，不累计错误计数（防雪崩）
-	ErrServer                     // 5xx 上游故障
-	ErrClient                     // 其他 4xx / 业务错误
+	ErrNone           ErrKind = iota // 成功
+	ErrHardCredit                    // 余额不足（402 或 body 关键词）→ 长冷却
+	ErrSoftRate                      // 429 软限流 → 短冷却
+	ErrSessionDead                   // 401 + 12153 offline session 失效 → 禁用
+	ErrNotFound                      // 404 上游偶发 → 短冷却，不累计错误计数（防雪崩）
+	ErrServer                        // 5xx 上游故障
+	ErrContentBlocked                // 内容策略拦截（400 + 审核文案）→ 不罚账号，走降级重试
+	ErrBadParams                     // 请求体解析失败（400 + Unmarshal chat params failed / 11101）→ 不罚账号，仍轮转
+	ErrClient                        // 其他 4xx / 业务错误
 )
 
 func (k ErrKind) String() string {
@@ -45,6 +50,10 @@ func (k ErrKind) String() string {
 		return "not_found"
 	case ErrServer:
 		return "server"
+	case ErrContentBlocked:
+		return "content_blocked"
+	case ErrBadParams:
+		return "bad_params"
 	case ErrClient:
 		return "client"
 	default:
@@ -104,6 +113,77 @@ var softRateMarkers = []string{
 
 var sessionDeadMarkers = []string{"Offline user session not found", "12153"}
 
+// contentBlockedMarkers 内容策略拦截关键词（大小写不敏感子串匹配）。
+//
+// 定位：上游按逐字精确指纹审核，system 来源的模板句（如 Claude Code/Codex
+// 注入指令）触发 HTTP 400 + 以下文案。这是「误报」（合法流量被审核误杀），
+// 非账号问题——该账号余额健康、未限流、session 未死，故 ErrContentBlocked
+// 在 applyErrorPolicy 中不罚账号（无冷却/熔断/NoteError），改由网关降级重试。
+var contentBlockedMarkers = []string{
+	"blocked by security policy",
+	"unapproved channel",
+	"illegal api invocation",
+}
+
+// badParamsMarkers 请求体解析失败关键词（issue #41 连带）：HTTP 400 + 上游
+// "Unmarshal chat params failed..."（code 11101）。这是"发给上游的 body 有问题"，
+// 与账号健康无关——不罚号，但仍轮转（commit B）。
+var badParamsMarkerMsg = "Unmarshal chat params failed"
+var badParamsMarkerCode = `"code":11101`
+
+// alreadyCheckinMarkers "今天已签到"关键词（上游对重复签到返回 code!=0，
+// 实测 code=10001/14001 "今天已签到"/"今日已签到"）。只对 *Error.Msg 做包含匹配，
+// 网络层/解析层错误不在此识别（见 IsAlreadyCheckin）。
+var alreadyCheckinMarkers = []string{"已签到", "already"}
+
+// softRateResetLoc 上游 429 6004 文案中的重置时间固定按 UTC+8 解释（上游文案如此，
+// 与容器时区无关）。
+var softRateResetLoc = time.FixedZone("UTC+8", 8*60*60)
+
+// SoftRateResetLoc 暴露重置时间的固定时区（供测试构造/断言同一时区口径）。
+func SoftRateResetLoc() *time.Location { return softRateResetLoc }
+
+// modelRateLimitCode 明确指向「模型级 429 限流」的业务 code。
+// 上游用它表达"该模型的使用量超限"（code 6004，msg 带「将在 … 重置」），
+// 而不是账号整体被限流——账号健康，只是这个模型此刻被限（issue #31）。
+const modelRateLimitCode = "6004"
+
+// softRateResetRe 匹配「将在 … 重置」，捕获中间的时间串。
+const softRateResetRe = `将在 (.+?) 重置`
+
+// softRateTimeLayout 上游重置时间的格式（无时区后缀；时区固定 UTC+8）。
+const softRateTimeLayout = "2006-01-02 15:04:05"
+
+// IsModelRateLimit 报告 429 body 是否明确指向模型级限流（业务 code 6004）。
+// 用于区分"账号级软限流"（按账号冷却）与"模型级用量限流"（切模型即可用）。
+func IsModelRateLimit(body string) bool {
+	// `"code":6004` / `"code": 6004` / `"code":"6004"` 均可命中（JSON 空格容差）。
+	re := regexp.MustCompile(`"code"\s*:\s*"?` + modelRateLimitCode + `"?`)
+	return re.MatchString(body)
+}
+
+// ParseSoftRateReset 从 429 body 解析「将在 … 重置」时间（上游 UTC+8 文案）。
+// 成功返回解析出的**墙钟时刻**（按 UTC+8 解释），失败返回零值 + false。
+// 内部先判 IsModelRateLimit：非模型级限流（非 6004）即使带"重置"字样也不返回——该重置
+// 无冷却语义（如 11140 的通用限流提示），解析出来反而会错误收窄冷却。
+func ParseSoftRateReset(body string) (time.Time, bool) {
+	if !IsModelRateLimit(body) {
+		return time.Time{}, false
+	}
+	re := regexp.MustCompile(softRateResetRe)
+	m := re.FindStringSubmatch(body)
+	if len(m) < 2 {
+		return time.Time{}, false
+	}
+	ts := strings.TrimSpace(m[1])
+	ts = strings.TrimSuffix(ts, " UTC+8") // 去掉后缀，固定按 softRateResetLoc 解释
+	t, err := time.ParseInLocation(softRateTimeLayout, ts, softRateResetLoc)
+	if err != nil {
+		return time.Time{}, false
+	}
+	return t, true
+}
+
 // Classify 按 HTTP 状态码 + body 判定错误类别。
 //
 // 判定顺序自「严」到「宽」，每层的先后都有语义依据：
@@ -148,7 +228,22 @@ func Classify(status int, body string) ErrKind {
 	if status >= 500 {
 		return ErrServer
 	}
+	// 内容策略拦截（HTTP 400 + 审核文案）：判在通用 ErrClient 之前。
+	// 这是误报信号，不罚账号，由网关降级重试处理（见 handler.applyErrorPolicy）。
 	if status >= 400 {
+		for _, m := range contentBlockedMarkers {
+			if strings.Contains(lower, m) {
+				return ErrContentBlocked
+			}
+		}
+		// 请求体解析失败（HTTP 400 + Unmarshal chat params failed / code 11101）：
+		// 这是"发给上游的 body 有问题"。网关侧截断已由 413 消灭（issue #41 commit A），
+		// 剩余来源是客户端 JSON 本身畸形——换了账号照样 400，不该罚号（白白冷却好号）。
+		// 归 ErrBadParams：不冷却/不熔断/不计错，但**仍然轮转**（不同账号可能有不同的
+		// 模型权限，值得再试一次）。
+		if strings.Contains(body, badParamsMarkerMsg) || strings.Contains(body, badParamsMarkerCode) {
+			return ErrBadParams
+		}
 		return ErrClient
 	}
 	// HTTP 200 但业务 code 非 0 且含余额关键词的情况已被上面 hardMarkers 捕获。
@@ -182,6 +277,14 @@ type Client struct {
 
 	// SanitizeFingerprints 出站请求体黑名单指纹脱敏开关（默认 true；false 完全还原）。
 	SanitizeFingerprints bool
+
+	// UserAgent 出站 User-Agent 覆盖（空 = 现状 clientUA）。
+	// 全部出站请求生效：chat / refresh / checkin / balance(含 report/travel) / FetchModels。
+	// issue #42 深挖：官网「使用端」列基于出站请求的 UA/X-Product 服务端归因，
+	// 官方 WorkBuddy 桌面 UA 为 `WorkBuddy/<version>`（product.json applicationName=WorkBuddy，
+	// UserAgentHttpInterceptor 把 productName/platform 前缀拼进 UA）。默认保持现状
+	// （指纹净化考虑），仅当用户显式配置才改写。
+	UserAgent string
 
 	ChatBaseCN    string
 	BillingBaseCN string
@@ -272,6 +375,13 @@ func (c *Client) billingBase(a *auth.Auth) string {
 	return c.BillingBaseCN
 }
 
+// billing 域端点路径（billingBase + path）。balance/checkin 与 report（report.go）同域，
+// 统一走 billingJSON 发请求。
+const (
+	billingMeterPath = "/v2/billing/meter/get-user-resource"
+	dailyCheckinPath = "/v2/billing/meter/daily-checkin"
+)
+
 // doJSON 发请求并解信封；HTTP 非 2xx 或业务 code != 0 时返回带 body 片段的 *Error。
 func (c *Client) doJSON(req *http.Request) (json.RawMessage, error) {
 	resp, err := c.HTTP.Do(req)
@@ -311,7 +421,7 @@ func (c *Client) RefreshToken(a *auth.Auth) error {
 	if err != nil {
 		return err
 	}
-	RefreshHeaders(req, a)
+	c.RefreshHeaders(req, a)
 	data, err := c.doJSON(req)
 	if err != nil {
 		return err
@@ -348,13 +458,13 @@ func (c *Client) ChatStream(a *auth.Auth, body []byte) (rc io.ReadCloser, status
 	if err != nil {
 		return nil, 0, nil, err
 	}
-	ChatHeaders(req, a)
+	c.ChatHeaders(req, a)
 	ctx, cancel := context.WithCancel(context.Background())
 	req = req.WithContext(ctx)
 	resp, err := c.chatHTTP().Do(req)
 	if err != nil {
 		cancel()
-		log.Printf("chat_stream uid=%s: transport error: %v", a.UID, err)
+		log.Printf("ERR: [upstream] chat_stream uid=%s: transport error: %v", logfmt.UID8(a.UID), err)
 		return nil, 0, nil, err
 	}
 	if resp.StatusCode >= 400 {
@@ -362,8 +472,8 @@ func (c *Client) ChatStream(a *auth.Auth, body []byte) (rc io.ReadCloser, status
 		resp.Body.Close()
 		cancel()
 		kind := Classify(resp.StatusCode, string(raw))
-		log.Printf("chat_stream uid=%s: upstream %d %s body=%s",
-			a.UID, resp.StatusCode, kind, truncate(string(raw), 200))
+		log.Printf("WARN: [upstream] chat_stream uid=%s: upstream %d %s body=%s",
+			logfmt.UID8(a.UID), resp.StatusCode, kind, truncate(string(raw), 200))
 		return nil, resp.StatusCode, raw, nil
 	}
 	// 成功分支：cancel 所有权交给 monitorBody（其 Close 会 cancel）；
@@ -389,12 +499,8 @@ func (c *Client) FetchModels(a *auth.Auth) ([]ModelInfo, error) {
 	if err != nil {
 		return nil, err
 	}
+	c.CommonHeaders(req, a) // 复用共享请求头（Origin/Referer/UA/Accept/Content-Type）
 	req.Header.Set("Authorization", "Bearer "+a.AccessToken)
-	req.Header.Set("Accept", "application/json")
-	origin := originRefererFor(a)
-	req.Header.Set("Origin", origin)
-	req.Header.Set("Referer", origin+"/")
-	req.Header.Set("User-Agent", clientUA)
 	resp, err := c.HTTP.Do(req)
 	if err != nil {
 		return nil, err
@@ -490,7 +596,6 @@ func (c *Client) FetchModels(a *auth.Auth) ([]ModelInfo, error) {
 
 // UserResource 查询账号当前可花费积分余额（所有套餐 CycleCapacity 聚合，负值钳 0）。
 func (c *Client) UserResource(a *auth.Auth) (remain int64, err error) {
-	url := c.billingBase(a) + "/v2/billing/meter/get-user-resource"
 	now := time.Now()
 	body := map[string]any{
 		"PageNumber":               1,
@@ -500,13 +605,7 @@ func (c *Client) UserResource(a *auth.Auth) (remain int64, err error) {
 		"PackageEndTimeRangeBegin": now.Format("2006-01-02 15:04:05"),
 		"PackageEndTimeRangeEnd":   now.Add(365 * 101 * 24 * time.Hour).Format("2006-01-02 15:04:05"),
 	}
-	raw, _ := json.Marshal(body)
-	req, err := http.NewRequest(http.MethodPost, url, bytes.NewReader(raw))
-	if err != nil {
-		return 0, err
-	}
-	BillingHeaders(req, a)
-	data, err := c.doJSON(req)
+	data, err := c.billingJSON(a, http.MethodPost, billingMeterPath, body)
 	if err != nil {
 		return 0, err
 	}
@@ -548,14 +647,24 @@ func (c *Client) UserResource(a *auth.Auth) (remain int64, err error) {
 
 // DailyCheckin 执行每日签到。已签到（业务 code 非 0）也返回错误，调用方按 msg 区分。
 func (c *Client) DailyCheckin(a *auth.Auth) error {
-	url := c.billingBase(a) + "/v2/billing/meter/daily-checkin"
-	req, err := http.NewRequest(http.MethodPost, url, bytes.NewReader([]byte("{}")))
-	if err != nil {
-		return err
-	}
-	BillingHeaders(req, a)
-	_, err = c.doJSON(req)
+	_, err := c.billingJSON(a, http.MethodPost, dailyCheckinPath, map[string]any{})
 	return err
+}
+
+// IsAlreadyCheckin 报告 err 是否表示"今天已签到"（上游幂等拒绝重复签到）。
+// 只认带分类的 *Error（业务 code 或 HTTP 错误）：网络层/解析层错误不得当作幂等成功，
+// 否则停机补签遇到抖动会误记为 already，账号当天实际未签到却被判定正常。
+func IsAlreadyCheckin(err error) bool {
+	var ue *Error
+	if !errors.As(err, &ue) {
+		return false
+	}
+	for _, m := range alreadyCheckinMarkers {
+		if strings.Contains(ue.Msg, m) || strings.Contains(strings.ToLower(ue.Msg), strings.ToLower(m)) {
+			return true
+		}
+	}
+	return false
 }
 
 func truncate(s string, n int) string {

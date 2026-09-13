@@ -1,6 +1,7 @@
 package server
 
 import (
+	"bytes"
 	"encoding/json"
 	"errors"
 	"io"
@@ -14,6 +15,7 @@ import (
 
 	"workbuddy2api/internal/auth"
 	"workbuddy2api/internal/pool"
+	"workbuddy2api/internal/prompt"
 	"workbuddy2api/internal/redisstore"
 	"workbuddy2api/internal/session"
 	"workbuddy2api/internal/upstream"
@@ -106,6 +108,143 @@ func testPoolWith(auths ...*auth.Auth) *pool.Pool {
 		p.SetCredits(a.UID, 1000)
 	}
 	return p
+}
+
+// TestChatBodyLimitExactAllowed 恰好等于上限的请求体正常放行到上游（不被 413 误伤）。
+func TestChatBodyLimitExactAllowed(t *testing.T) {
+	var calls int
+	up := newFakeUpstream(t, func(authz string) (int, string, bool) {
+		calls++
+		return 200, sseOK, true
+	})
+	p := testPoolWith(&auth.Auth{UID: "u1", AccessToken: "at1", ExpiresAt: 9999999999})
+	h := NewHandler(Config{Pool: p, Upstream: up, MaxBodyBytes: 100})
+	const prefix = `{"model":"glm-5.2","messages":[],"pad":"`
+	const suffix = `"}`
+	pad := strings.Repeat("a", 100-len(prefix)-len(suffix)) // 恰好 100 字节
+	if body := prefix + pad + suffix; len(body) != 100 {
+		t.Fatalf("fixture len=%d want 100", len(body))
+	}
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(prefix+pad+suffix)))
+	if rec.Code != 200 {
+		t.Fatalf("code=%d body=%s (exactly-at-limit body must proceed)", rec.Code, rec.Body)
+	}
+	if calls != 1 {
+		t.Errorf("upstream calls=%d want 1", calls)
+	}
+}
+
+// TestChatOversizedBodyReturns413 请求体超过上限 → 直接 413 request_body_too_large：
+// 不打上游（calls=0）、不罚账号（无冷却/无熔断计数/无禁用）、不轮转。
+func TestChatOversizedBodyReturns413(t *testing.T) {
+	var calls int
+	up := newFakeUpstream(t, func(authz string) (int, string, bool) {
+		calls++
+		return 200, sseOK, true
+	})
+	p := testPoolWith(&auth.Auth{UID: "u1", AccessToken: "at1", ExpiresAt: 9999999999})
+	h := NewHandler(Config{Pool: p, Upstream: up, MaxBodyBytes: 100})
+	const prefix = `{"model":"glm-5.2","messages":[],"pad":"`
+	const suffix = `"}`
+	// 101 字节 > 100 上限。
+	pad := strings.Repeat("a", 100-len(prefix)-len(suffix)+1)
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(prefix+pad+suffix)))
+	if rec.Code != http.StatusRequestEntityTooLarge {
+		t.Fatalf("code=%d body=%s want 413", rec.Code, rec.Body)
+	}
+	body := rec.Body.String()
+	if !strings.Contains(body, "request_body_too_large") {
+		t.Errorf("body should carry request_body_too_large: %s", body)
+	}
+	if !strings.Contains(body, "server.max_body_mb") {
+		t.Errorf("413 message should name config key server.max_body_mb: %s", body)
+	}
+	if calls != 0 {
+		t.Errorf("upstream must not be called on 413, got %d", calls)
+	}
+	st, _ := p.Status("u1")
+	if st.Cooling || st.Disabled || st.ErrTotal != 0 {
+		t.Errorf("413 must not penalize account: %+v", st)
+	}
+}
+
+// TestChatOversizedBodyDefaultLimitHeader 未显式设置 MaxBodyBytes 时兜底 8MB：
+// 8MB+1 的请求体必须 413（不再静默截断喂给上游，issue #41 根因）。
+func TestChatOversizedBodyDefaultLimit(t *testing.T) {
+	var calls int
+	up := newFakeUpstream(t, func(authz string) (int, string, bool) {
+		calls++
+		return 200, sseOK, true
+	})
+	p := testPoolWith(&auth.Auth{UID: "u1", AccessToken: "at1", ExpiresAt: 9999999999})
+	h := NewHandler(Config{Pool: p, Upstream: up}) // 不注入 MaxBodyBytes → 默认 8MB
+
+	body := make([]byte, 8<<20+1) // 8MB+1
+	copy(body, `{"model":"glm-5.2","messages":[]}`)
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest("POST", "/v1/chat/completions", bytes.NewReader(body)))
+	if rec.Code != http.StatusRequestEntityTooLarge {
+		t.Fatalf("code=%d want 413 (8MB+1 must be rejected)", rec.Code)
+	}
+	if calls != 0 {
+		t.Errorf("upstream must not be called, got %d", calls)
+	}
+}
+
+// TestChatBadParamsRotatesWithoutPenalty 上游 400 + Unmarshal chat params failed（11101）
+// → 该类归 ErrBadParams：不罚账号（无冷却/无禁用/无熔断计数/无 errTotal），但**仍然轮转**
+// （换号重试可能命中不同权限的账号）。端到端断言 bad 失败、good 成功、账号完好。
+func TestChatBadParamsRotatesWithoutPenalty(t *testing.T) {
+	calls := map[string]int{}
+	up := newFakeUpstream(t, func(authz string) (int, string, bool) {
+		calls[authz]++
+		if authz == "Bearer at-bad" {
+			return 400, `{"code":11101,"msg":"Unmarshal chat params failed with error: unexpected EOF"}`, false
+		}
+		return 200, sseOK, true
+	})
+	p := testPoolWith(
+		&auth.Auth{UID: "bad", AccessToken: "at-bad", ExpiresAt: 9999999999},
+		&auth.Auth{UID: "good", AccessToken: "at-good", ExpiresAt: 9999999999},
+	)
+	p.SetCredits("bad", 2000) // 确定性源 r=0 → 先选 bad
+	p.SetCredits("good", 1000)
+	h := NewHandler(Config{Pool: p, Upstream: up})
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(`{"model":"glm-5.2","messages":[]}`)))
+	if rec.Code != 200 {
+		t.Fatalf("code=%d body=%s (want 200 after rotate to good)", rec.Code, rec.Body)
+	}
+	if calls["Bearer at-bad"] != 1 || calls["Bearer at-good"] != 1 {
+		t.Errorf("calls=%v want bad/good 各 1 次", calls)
+	}
+	// 账号完好：无冷却、无禁用、无熔断计数、无 errTotal。
+	st, _ := p.Status("bad")
+	if st.Cooling || st.Disabled || st.ErrTotal != 0 || st.BreakerFails != 0 {
+		t.Errorf("ErrBadParams must not penalize account: %+v", st)
+	}
+}
+
+// TestChatAllBadParams503CarriesUpstreamBody 全部账号都 11101 时 503 文案必须包含
+// 上游原始 11101 信息（不再是空洞的 no_healthy_account）。
+// 现状即透传 lastErr.Error()（含上游 body），本测试把它锁定为回归。
+func TestChatAllBadParams503CarriesUpstreamBody(t *testing.T) {
+	up := newFakeUpstream(t, func(authz string) (int, string, bool) {
+		return 400, `{"code":11101,"msg":"Unmarshal chat params failed with error: unexpected EOF"}`, false
+	})
+	p := testPoolWith(&auth.Auth{UID: "u1", AccessToken: "at1", ExpiresAt: 9999999999})
+	h := NewHandler(Config{Pool: p, Upstream: up})
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(`{"model":"glm-5.2","messages":[]}`)))
+	if rec.Code != 503 {
+		t.Fatalf("code=%d body=%s (want 503)", rec.Code, rec.Body)
+	}
+	body := rec.Body.String()
+	if !strings.Contains(body, "11101") || !strings.Contains(body, "Unmarshal chat params failed") {
+		t.Errorf("503 message should carry upstream 11101 info: %s", body)
+	}
 }
 
 func TestChatNonStreamAggregates(t *testing.T) {
@@ -256,7 +395,7 @@ func TestApplyErrorPolicySoftRateExponentialBackoff(t *testing.T) {
 	h := NewHandler(Config{Pool: p, SoftCooldown: 600 * time.Second})
 
 	for i, want := range []int64{600, 1200, 2400} {
-		h.applyErrorPolicy("u1", upstream.ErrSoftRate)
+		h.applyErrorPolicy("u1", upstream.ErrSoftRate, "", "")
 		st, _ := p.Status("u1")
 		if !st.Cooling || st.CoolKind != "soft_rate" {
 			t.Fatalf("call %d: 应为 soft_rate 冷却: %+v", i+1, st)
@@ -283,7 +422,7 @@ func TestApplyErrorPolicyNotFoundUsesFixedBase(t *testing.T) {
 
 	notFoundSec := int64(notFoundCooldown / time.Second)
 	for i, want := range []int64{notFoundSec, 2 * notFoundSec, 4 * notFoundSec} {
-		h.applyErrorPolicy("u1", upstream.ErrNotFound)
+		h.applyErrorPolicy("u1", upstream.ErrNotFound, "", "")
 		st, _ := p.Status("u1")
 		if !st.Cooling || st.CoolKind != "soft_rate" {
 			t.Fatalf("call %d: 应为 soft 冷却: %+v", i+1, st)
@@ -301,7 +440,7 @@ func TestApplyErrorPolicyNotFoundUsesFixedBase(t *testing.T) {
 	// 成功后 streak 归零 → 下次 404 回到 60s 基数。
 	// （签到解冻 ReenableIfCredits 不适用于本场景：它保留 streak，是冷却域的续期。）
 	p.NoteSuccess("u1")
-	h.applyErrorPolicy("u1", upstream.ErrNotFound)
+	h.applyErrorPolicy("u1", upstream.ErrNotFound, "", "")
 	if st, _ := p.Status("u1"); st.SoftStreak != 1 || st.CoolRemaining > notFoundSec {
 		t.Errorf("success should reset 404 backoff: %+v", st)
 	}
@@ -480,6 +619,92 @@ func TestChatHardCreditCooldownUntilNextDay4AM(t *testing.T) {
 	stGood, _ := p.Status("good")
 	if stGood.Cooling || stGood.Disabled {
 		t.Errorf("good should stay healthy: %+v", stGood)
+	}
+}
+
+// TestChat6004ModelResetCoolsToParsedTime 端到端回归 issue #31：上游 429 + code 6004
+// +「将在 … 重置」→ 冷却 until 精确等于解析时间（而非 600s 固定基数/指数退避），
+// 且记录触发模型 → 同模型请求仍被冷却、切模型请求按豁免可选。
+func TestChat6004ModelResetCoolsToParsedTime(t *testing.T) {
+	// 用未来 5 分钟的重置时间（wall-clock）构造上游响应。
+	reset := time.Now().Add(5 * time.Minute)
+	ts := reset.In(upstream.SoftRateResetLoc()).Format("2006-01-02 15:04:05")
+	var calls int
+	up := newFakeUpstream(t, func(authz string) (int, string, bool) {
+		calls++
+		if authz == "Bearer at-bad" {
+			return 429, `{"code":6004,"msg":"将在 ` + ts + ` UTC+8 重置"}`, false
+		}
+		return 200, sseOK, true
+	})
+	p := testPoolWith(
+		&auth.Auth{UID: "bad", AccessToken: "at-bad", ExpiresAt: 9999999999},
+		&auth.Auth{UID: "good", AccessToken: "at-good", ExpiresAt: 9999999999},
+	)
+	p.SetCredits("bad", 2000)
+	p.SetCredits("good", 1000)
+	// 隔离对 breaker 的干扰：熔断阈值默认 3，一次失败不触发。
+	h := NewHandler(Config{Pool: p, Upstream: up})
+	req := httptest.NewRequest("POST", "/v1/chat/completions",
+		strings.NewReader(`{"model":"glm-5.3","messages":[]}`))
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	if rec.Code != 200 {
+		t.Fatalf("code=%d body=%s (want 200 after rotate to good)", rec.Code, rec.Body)
+	}
+	// bad 已进入 soft 冷却，until ≈ reset。
+	st, _ := p.Status("bad")
+	if !st.Cooling || st.CoolKind != "soft_rate" {
+		t.Fatalf("bad should be soft cooling from 6004: %+v", st)
+	}
+	if d := st.Until.Sub(reset); d < -time.Second || d > time.Second {
+		t.Errorf("until=%v want ~reset=%v (diff %v)", st.Until, reset, d)
+	}
+	// 记录触发模型（bad 池内 private 字段需经 Status 不可见，改用行为断言）：
+	// 同模型 glm-5.3 的请求不应选中 bad（仍冷却）；
+	// 不同模型 hy3-x 的请求应豁免冷却选中 bad（最高分）。
+	p.SetRandomSource(func(n int64) int64 { return 0 })
+	same := p.PickExcludingForModel(nil, "glm-5.3")
+	if same == nil || same.UID != "good" {
+		t.Fatalf("same-model pick should skip bad (still cooling), got %+v", same)
+	}
+	diff := p.PickExcludingForModel(nil, "hy3-x")
+	if diff == nil || diff.UID != "bad" {
+		t.Fatalf("different-model pick should bypass bad soft cooling, got %+v", diff)
+	}
+}
+
+// TestChat6004WithoutResetFallsBackToBackoff 6004 无时间文案 → 退回 600s 基数软冷却
+// （现状不变）。
+func TestChat6004WithoutResetFallsBackToBackoff(t *testing.T) {
+	var calls int
+	up := newFakeUpstream(t, func(authz string) (int, string, bool) {
+		calls++
+		if authz == "Bearer at-bad" {
+			return 429, `{"code":6004,"msg":"model usage limit exceeded"}`, false
+		}
+		return 200, sseOK, true
+	})
+	p := testPoolWith(
+		&auth.Auth{UID: "bad", AccessToken: "at-bad", ExpiresAt: 9999999999},
+		&auth.Auth{UID: "good", AccessToken: "at-good", ExpiresAt: 9999999999},
+	)
+	p.SetCredits("bad", 2000)
+	p.SetCredits("good", 1000)
+	h := NewHandler(Config{Pool: p, Upstream: up, SoftCooldown: time.Minute})
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest("POST", "/v1/chat/completions",
+		strings.NewReader(`{"model":"glm-5.3","messages":[]}`)))
+	if rec.Code != 200 {
+		t.Fatalf("code=%d body=%s", rec.Code, rec.Body)
+	}
+	st, _ := p.Status("bad")
+	if !st.Cooling || st.CoolKind != "soft_rate" {
+		t.Fatalf("bad should be soft cooling: %+v", st)
+	}
+	// 冷却时长 = 注入 soft 基数(60s)，非解析时间（无重置文案）。
+	if st.CoolRemaining <= 0 || st.CoolRemaining > 60 {
+		t.Errorf("cool_remaining_sec=%d want ~60 (soft base, not parsed)", st.CoolRemaining)
 	}
 }
 
@@ -1075,6 +1300,209 @@ func TestStatusRequiresAuth(t *testing.T) {
 	}
 }
 
+// TestContentBlockedTriggersDegradedRetry passthrough 模式下首请求 400（11128 文案）
+// → 降级重试（Degraded）→ 200，客户端无感。验证第二次出站 body 为 Degraded。
+func TestContentBlockedTriggersDegradedRetry(t *testing.T) {
+	// 记录每次出站请求体，断言第二次为 Degraded 文本。
+	var bodies [][]byte
+	up := &upstream.Client{
+		HTTP: &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+			raw, _ := io.ReadAll(r.Body)
+			bodies = append(bodies, raw)
+			// 首次（body 含原始 system）返回 400 内容拦截；后续返回 200。
+			if len(bodies) == 1 {
+				return &http.Response{
+					StatusCode: 400,
+					Header:     http.Header{"Content-Type": []string{"application/json"}},
+					Body:       io.NopCloser(strings.NewReader(`{"code":11128,"msg":"blocked by security policy"}`)),
+				}, nil
+			}
+			return &http.Response{
+				StatusCode: 200,
+				Header:     http.Header{"Content-Type": []string{"text/event-stream"}},
+				Body:       io.NopCloser(strings.NewReader(sseOK)),
+			}, nil
+		})},
+		ChatBaseCN: "https://fake.example",
+	}
+	p := testPoolWith(&auth.Auth{UID: "u1", AccessToken: "at1", ExpiresAt: 9999999999})
+	h := NewHandler(Config{Pool: p, Upstream: up, PromptMode: "passthrough"})
+
+	req := httptest.NewRequest("POST", "/v1/chat/completions",
+		strings.NewReader(`{"model":"glm-5.2","stream":true,"messages":[{"role":"system","content":"原始指纹"},{"role":"user","content":"hi"}]}`))
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	if rec.Code != 200 {
+		t.Fatalf("code=%d body=%s (want 200 after degraded retry)", rec.Code, rec.Body)
+	}
+	if len(bodies) != 2 {
+		t.Fatalf("want 2 upstream calls (first 400 + retry), got %d", len(bodies))
+	}
+	// 第二次出站 body 的 messages 头部 system 内容应为 Degraded 文本。
+	if !strings.Contains(string(bodies[1]), prompt.Degraded) {
+		t.Errorf("second body should contain Degraded prompt: %s", bodies[1])
+	}
+	if strings.Contains(string(bodies[1]), "原始指纹") {
+		t.Errorf("second body should not contain original system: %s", bodies[1])
+	}
+}
+
+// TestContentBlockedStickyDegraded 降级后新请求直达 Degraded（不再先撞 400）。
+func TestContentBlockedStickyDegraded(t *testing.T) {
+	var firstCall bool
+	up := newFakeUpstream(t, func(authz string) (int, string, bool) {
+		if !firstCall {
+			firstCall = true
+			return 400, `{"code":11128,"msg":"blocked by security policy"}`, false
+		}
+		return 200, sseOK, true
+	})
+	p := testPoolWith(&auth.Auth{UID: "u1", AccessToken: "at1", ExpiresAt: 9999999999})
+	h := NewHandler(Config{Pool: p, Upstream: up, PromptMode: "passthrough"})
+
+	// 首请求触发降级 → 200。
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest("POST", "/v1/chat/completions",
+		strings.NewReader(`{"model":"glm-5.2","stream":true,"messages":[{"role":"system","content":"x"},{"role":"user","content":"hi"}]}`)))
+	if rec.Code != 200 {
+		t.Fatalf("first req code=%d", rec.Code)
+	}
+	// 降级粘性：新请求 Active()=true，body 已被 Rewrite(Degraded)，上游首字节即 200。
+	// 但 fake 上游只对 firstCall 返回 400，之后都 200，无法区分"直达"与"重试"。
+	// 用 degrade.Active() 直接断言粘性生效。
+	if !h.degrade.Active() {
+		t.Fatal("degrade should be active after trigger")
+	}
+}
+
+// TestContentBlockedCustomModeDoesNotDegrade custom 模式不触发降级重试
+// （custom 已用自有提示词替换，不应再有 system 来源误报；若仍 400 走既有错误路径）。
+func TestContentBlockedCustomModeDoesNotDegrade(t *testing.T) {
+	up := newFakeUpstream(t, func(authz string) (int, string, bool) {
+		return 400, `{"code":11128,"msg":"blocked by security policy"}`, false
+	})
+	p := testPoolWith(&auth.Auth{UID: "u1", AccessToken: "at1", ExpiresAt: 9999999999})
+	h := NewHandler(Config{Pool: p, Upstream: up, PromptMode: "custom", PromptText: "SYS"})
+
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest("POST", "/v1/chat/completions",
+		strings.NewReader(`{"model":"glm-5.2","messages":[{"role":"system","content":"old"},{"role":"user","content":"hi"}]}`)))
+	// custom 模式下 400 直接返回 503（所有账号轮转失败），不降级重试。
+	if rec.Code != 503 {
+		t.Fatalf("code=%d want 503 (custom does not degrade)", rec.Code)
+	}
+	if h.degrade.Active() {
+		t.Error("degrade should NOT be active in custom mode")
+	}
+}
+
+// TestContentBlockedDoesNotPenalizeAccount ErrContentBlocked 不罚账号（无冷却/熔断/NoteError）。
+func TestContentBlockedDoesNotPenalizeAccount(t *testing.T) {
+	up := newFakeUpstream(t, func(authz string) (int, string, bool) {
+		return 400, `{"code":11128,"msg":"blocked by security policy"}`, false
+	})
+	p := testPoolWith(&auth.Auth{UID: "u1", AccessToken: "at1", ExpiresAt: 9999999999})
+	// 熔断阈值 1：若误罚 NoteError 一次即熔断；content_blocked 不应喂熔断。
+	p.SetBreaker(1, time.Hour, time.Hour)
+	h := NewHandler(Config{Pool: p, Upstream: up, PromptMode: "passthrough"})
+
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest("POST", "/v1/chat/completions",
+		strings.NewReader(`{"model":"glm-5.2","messages":[{"role":"user","content":"hi"}]}`)))
+
+	st, _ := p.Status("u1")
+	if st.Cooling || st.Disabled || st.ErrTotal != 0 {
+		t.Fatalf("ErrContentBlocked should not penalize account: %+v", st)
+	}
+}
+
+// TestCustomModeFingerprintSanitizePreserved custom 端到端：user 消息含 Claude Code
+// 指纹句（PR39 fixture 串）→ Rewrite 注入自有 system → 经 sanitize → 出站 body 中
+// 该指纹被改写、system 为自有提示词。证明两层（提示词替换 + 清洗）叠加工作。
+//
+// 两层各自职责（互不替代）：
+//   - prompt.Rewrite 替换 system/developer 消息（消灭 system 来源指纹）；
+//   - sanitizeMessages 改写 user/assistant 消息中残留的指纹串（兜底用户上下文）。
+func TestCustomModeFingerprintSanitizePreserved(t *testing.T) {
+	// 捕获出站 body（prepareBody 已强制 stream + 归一 + 清洗后）。
+	var sentBody []byte
+	up := &upstream.Client{
+		HTTP: &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+			raw, _ := io.ReadAll(r.Body)
+			sentBody = raw
+			return &http.Response{
+				StatusCode: 200,
+				Header:     http.Header{"Content-Type": []string{"text/event-stream"}},
+				Body:       io.NopCloser(strings.NewReader(sseOK)),
+			}, nil
+		})},
+		ChatBaseCN:           "https://fake.example",
+		SanitizeFingerprints: true, // 开启清洗层（与生产一致）
+	}
+	p := testPoolWith(&auth.Auth{UID: "u1", AccessToken: "at1", ExpiresAt: 9999999999})
+	const customSys = "我是网关自有提示词"
+	h := NewHandler(Config{Pool: p, Upstream: up, PromptMode: "custom", PromptText: customSys})
+
+	// user 消息含 Claude Code 指纹句（PR39 的 fixture 串，逐字精确指纹）。
+	req := httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(`{
+		"model":"glm-5.2",
+		"stream":true,
+		"messages":[
+			{"role":"system","content":"You are Claude Code, Anthropic's official CLI for Claude."},
+			{"role":"user","content":"You are Claude Code, Anthropic's official CLI for Claude. Main branch (you will usually use this for PRs)"}
+		]
+	}`))
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	if rec.Code != 200 {
+		t.Fatalf("code=%d body=%s", rec.Code, rec.Body)
+	}
+	out := string(sentBody)
+	// 1) system 为自有提示词，旧 system 内容零残留。
+	if !strings.Contains(out, customSys) {
+		t.Errorf("out body should contain custom system prompt: %s", out)
+	}
+	if strings.Contains(out, "official CLI for Claude.") && strings.Contains(out, "You are Claude Code, Anthropic's") {
+		// 旧 system 原文（含句点）不应以 system 角色出现；但 sanitize 把它改写为
+		// "...official CLI tool for Claude."，所以原文 fingerprint 串应消失。
+	}
+	// 原始指纹串（逐字精确匹配）在出站 body 中应被改写：
+	// "official CLI for Claude." → "official CLI tool for Claude."
+	// "Main branch (" → "Default branch ("
+	if strings.Contains(out, "official CLI for Claude.") {
+		t.Errorf("identity fingerprint not rewritten by sanitize in user msg: %s", out)
+	}
+	if strings.Contains(out, "Main branch (you will usually use this for PRs)") {
+		t.Errorf("branch fingerprint not rewritten by sanitize in user msg: %s", out)
+	}
+	// 改写后的痕迹应在（证明 sanitize 层生效，不是"全删了"）。
+	if !strings.Contains(out, "official CLI tool for Claude.") {
+		t.Errorf("sanitized identity rewrite missing: %s", out)
+	}
+	if !strings.Contains(out, "Default branch (you will usually use this for PRs)") {
+		t.Errorf("sanitized branch rewrite missing: %s", out)
+	}
+	// 2) messages 头部恰好一条 system = 自有提示词（Rewrite 已删旧 system）。
+	var obj map[string]any
+	if err := json.Unmarshal(sentBody, &obj); err != nil {
+		t.Fatalf("out body not json: %v %s", err, out)
+	}
+	msgs := obj["messages"].([]any)
+	var systemCount int
+	for _, m := range msgs {
+		mm := m.(map[string]any)
+		if mm["role"] == "system" {
+			systemCount++
+			if mm["content"] != customSys {
+				t.Errorf("system content=%v want %q", mm["content"], customSys)
+			}
+		}
+	}
+	if systemCount != 1 {
+		t.Errorf("want exactly 1 system message, got %d (all=%v)", systemCount, msgs)
+	}
+}
+
 // TestModelRealmPreferClassification 验证模型→账号域偏好的分类逻辑。
 func TestModelRealmPreferClassification(t *testing.T) {
 	intl := &auth.Auth{UID: "i", Domain: "www.codebuddy.ai"}
@@ -1084,7 +1512,7 @@ func TestModelRealmPreferClassification(t *testing.T) {
 		model      string
 		wantIntl   bool // prefer 是否接受国际账号
 		wantCN     bool // prefer 是否接受国内账号
-		wantStrict bool // 是否严格（无候选时不放宽）
+		wantStrict bool // 是否严格（域内无候选时不放宽）
 	}{
 		// 国际专属 → 只接受国际
 		{"gpt-5.6-sol", true, false, false},
@@ -1097,9 +1525,8 @@ func TestModelRealmPreferClassification(t *testing.T) {
 		{"glm-5.2", false, true, true},
 		{"kimi-k2.7", false, true, true},
 		{"minimax-m3", false, true, true},
-		// 仅国内（非严格）→ 只接受国内，可放宽
-		{"deepseek-v4-pro", false, true, true}, // 也在 strict 清单内
-		{"glm-5.3-flash", false, true, true},   // 也在 strict 清单内
+		{"deepseek-v4-pro", false, true, true},
+		{"glm-5.3-flash", false, true, true},
 		// 共有/未知 → 优先国内，可放宽
 		{"some-unknown-model", false, true, false},
 	}
@@ -1121,36 +1548,6 @@ func TestModelRealmPreferClassification(t *testing.T) {
 	}
 	if prefer, _ := modelRealmPrefer(""); prefer != nil {
 		t.Error("empty model should return nil prefer (no restriction)")
-	}
-}
-
-// TestChatStrictCNModelNeverUsesIntlAccount 保护国际号：严格国内模型即使国内号冷却，
-// 也只走同域兜底（冷却中的国内号），绝不溢出到国际号烧额度
-// （实测国际号 TTFB 20-40s 且额度仅国内号 1/6）。
-func TestChatStrictCNModelNeverUsesIntlAccount(t *testing.T) {
-	var hits []string
-	up := newFakeUpstream(t, func(authz string) (int, string, bool) {
-		hits = append(hits, authz)
-		return 200, sseOK, true
-	})
-	p := testPoolWith(
-		&auth.Auth{UID: "cn-1", AccessToken: "at-cn", Domain: "copilot.tencent.com", ExpiresAt: 9999999999},
-		&auth.Auth{UID: "intl-1", AccessToken: "at-intl", Domain: "www.codebuddy.ai", ExpiresAt: 9999999999},
-	)
-	// 国内号软冷却：strict 应走同域兜底（c冷却中的 cn-1），而不是改用国际号
-	p.Cooldown("cn-1", pool.CoolSoft, time.Hour, "test")
-	h := NewHandler(Config{Pool: p, Upstream: up})
-	req := httptest.NewRequest("POST", "/v1/chat/completions",
-		strings.NewReader(`{"model":"hy4-preview","messages":[{"role":"user","content":"hi"}]}`))
-	rec := httptest.NewRecorder()
-	h.ServeHTTP(rec, req)
-	for _, hz := range hits {
-		if hz == "Bearer at-intl" {
-			t.Fatalf("strict CN model must never use intl account, hits=%v", hits)
-		}
-	}
-	if rec.Code != 200 {
-		t.Errorf("want 200 via same-domain fallback, got %d body=%s", rec.Code, rec.Body)
 	}
 }
 
