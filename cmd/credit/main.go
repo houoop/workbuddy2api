@@ -10,22 +10,28 @@
 //	 "total":{"remain":N,"used":N,"size":N,"accounts":N,"ok":N,"failed":N},
 //	 "accounts":[{"uid","nickname","remain","used","size","packages","ok","error?"}]}
 //
-// 接口与聚合逻辑：POST codebuddy.cn/v2/billing/meter/get-user-resource，聚合所有 package 的
-// Cycle* 字段，TotalDosage 作 size 下限。
+// realm 感知：复用 upstream.Client（auth.Parse + upstream.New），global 账号查积分
+// 走 workbuddy.ai /billing/meter/*（404 回落 /v2），CN 账号维持 codebuddy.cn
+// /v2/billing/meter/get-user-resource（现状逐字）。聚合口径即 upstream.ResourceSummary。
 package main
 
 import (
-	"bytes"
 	"encoding/json"
 	"fmt"
-	"net/http"
 	"os"
+<<<<<<< HEAD
 	"path/filepath"
 	"sort"
 	"strings"
+=======
+>>>>>>> upstream-v2
 	"time"
+
+	"workbuddy2api/internal/auth"
+	"workbuddy2api/internal/upstream"
 )
 
+<<<<<<< HEAD
 const billingBaseCN = "https://www.codebuddy.cn"
 const billingBaseIntl = "https://www.codebuddy.ai"
 
@@ -41,6 +47,8 @@ type authFile struct {
 	} `json:"account"`
 }
 
+=======
+>>>>>>> upstream-v2
 type accountResult struct {
 	UID      string `json:"uid"`
 	Nickname string `json:"nickname"`
@@ -52,6 +60,7 @@ type accountResult struct {
 	Error    string `json:"error,omitempty"`
 }
 
+<<<<<<< HEAD
 type resourcePackage struct {
 	CapacityRemain      int64 `json:"CapacityRemain"`
 	CapacityUsed        int64 `json:"CapacityUsed"`
@@ -173,29 +182,43 @@ func fetchUserResource(af *authFile) (remain, used, size int64, packs int, err e
 	return remain, used, size, packs, nil
 }
 
+=======
+>>>>>>> upstream-v2
 func main() {
 	pretty := len(os.Args) > 1 && os.Args[1] == "-pretty"
 	authDir := "./auths"
 	if v := os.Getenv("WB2A_AUTH_DIR"); v != "" {
 		authDir = v
 	}
-	files, _ := filepath.Glob(filepath.Join(authDir, "workbuddy-*.json"))
-	sort.Strings(files)
+	up := upstream.New()
+	up.GlobalEnabled = true // 允许按 realm 路由：global 账查积分走 workbuddy.ai
+	accounts := collect(authDir, up)
+	printAccounts(accounts, pretty)
+}
 
+// collect 遍历 auths 目录并查询每个账号的积分摘要。供测试注入 fake upstream 断言
+// realm 路由（main 从 os.Args/env 取况，collect 单一来源可测）。
+// 文件清单走 auth.LoadAuthFiles（宽侧 workbuddy*.json）：与网关 LoadDir 同口径，
+// 不带连字符的文件不再被跳过（P2-10，审查发现 10）。
+func collect(authDir string, up *upstream.Client) []accountResult {
+	files, _ := auth.LoadAuthFiles(authDir)
 	accounts := make([]accountResult, 0, len(files))
 	for _, f := range files {
-		var af authFile
 		raw, err := os.ReadFile(f)
-		if err != nil || json.Unmarshal(raw, &af) != nil {
+		if err != nil {
 			continue
 		}
-		res := accountResult{UID: af.Account.UID, Nickname: af.Account.Nickname}
-		if af.Auth.AccessToken == "" {
+		a, err := auth.Parse(raw)
+		if err != nil {
+			continue
+		}
+		res := accountResult{UID: a.UID, Nickname: a.Nickname}
+		if a.AccessToken == "" {
 			res.Error = "no accessToken"
 			accounts = append(accounts, res)
 			continue
 		}
-		remain, used, size, packs, err := fetchUserResource(&af)
+		remain, used, size, packs, err := up.ResourceSummary(a)
 		if err != nil {
 			res.Error = err.Error()
 		} else {
@@ -208,7 +231,11 @@ func main() {
 		accounts = append(accounts, res)
 		time.Sleep(200 * time.Millisecond)
 	}
+	return accounts
+}
 
+// printAccounts 汇总并输出结果：-pretty 走人类可读日报，否则 JSON（与老版输出一致）。
+func printAccounts(accounts []accountResult, pretty bool) {
 	var totalRemain, totalUsed, totalSize int64
 	okCount := 0
 	for _, a := range accounts {
@@ -225,6 +252,10 @@ func main() {
 			}
 		}
 	}
+	if pretty {
+		printPretty(accounts, totalRemain, totalUsed, totalSize, okCount)
+		return
+	}
 	out := map[string]any{
 		"service": "workbuddy",
 		"ts":      time.Now().Unix(),
@@ -237,10 +268,6 @@ func main() {
 			"failed":   len(accounts) - okCount,
 		},
 		"accounts": accounts,
-	}
-	if pretty {
-		printPretty(accounts, totalRemain, totalUsed, totalSize, okCount)
-		return
 	}
 	raw, _ := json.Marshal(out)
 	fmt.Println(string(raw))

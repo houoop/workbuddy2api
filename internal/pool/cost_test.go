@@ -12,6 +12,9 @@ import (
 func TestNoteModelCostAndPreferFree(t *testing.T) {
 	withNoPickGap(t)
 	p := New("")
+	// 探索关停前置（issue #136）：本测试锚定「无探索义务时的成本优先语义」，
+	// 层序语义不变，显式关停新增的 costTier 探索维度（设计报告 §4 T9）。
+	p.SetCostExploreInterval(0)
 	p.SetRandomSource(func(n int64) int64 { return 0 })
 	p.Add(&auth.Auth{UID: "free"})
 	p.Add(&auth.Auth{UID: "paid"})
@@ -23,7 +26,7 @@ func TestNoteModelCostAndPreferFree(t *testing.T) {
 	p.NoteModelCost("paid", "hy4-preview", 2.9, 1000) // 收费
 
 	for i := 0; i < 50; i++ {
-		a := p.PickExcludingForModel(nil, "hy4-preview")
+		a := p.PickExcludingForRealm(nil, "hy4-preview", "")
 		if a == nil || a.UID != "free" {
 			t.Fatalf("第 %d 次选中 %v，want free（免费号应优先于高积分收费号）", i, a)
 		}
@@ -34,13 +37,16 @@ func TestNoteModelCostAndPreferFree(t *testing.T) {
 func TestModelCostCheaperPaidWins(t *testing.T) {
 	withNoPickGap(t)
 	p := New("")
+	// 探索关停前置（issue #136）：本测试锚定「无探索义务时的成本优先语义」，
+	// 层序语义不变，显式关停新增的 costTier 探索维度（设计报告 §4 T9）。
+	p.SetCostExploreInterval(0)
 	p.SetRandomSource(func(n int64) int64 { return 0 })
 	p.Add(&auth.Auth{UID: "cheap"})
 	p.Add(&auth.Auth{UID: "pricey"})
 	p.NoteModelCost("cheap", "hy4-preview", 0.3, 1000)
 	p.NoteModelCost("pricey", "hy4-preview", 5.0, 1000)
 	for i := 0; i < 50; i++ {
-		a := p.PickExcludingForModel(nil, "hy4-preview")
+		a := p.PickExcludingForRealm(nil, "hy4-preview", "")
 		if a == nil || a.UID != "cheap" {
 			t.Fatalf("选中 %v, want cheap（单价低的优先）", a)
 		}
@@ -53,6 +59,9 @@ func TestModelCostCheaperPaidWins(t *testing.T) {
 func TestModelCostUnknownBeatsKnownPaid(t *testing.T) {
 	withNoPickGap(t)
 	p := New("")
+	// 探索关停前置（issue #136）：本测试锚定「无探索义务时的成本优先语义」，
+	// 层序语义不变，显式关停新增的 costTier 探索维度（设计报告 §4 T9）。
+	p.SetCostExploreInterval(0)
 	p.SetRandomSource(func(n int64) int64 { return 0 })
 	p.Add(&auth.Auth{UID: "unknown"})
 	p.Add(&auth.Auth{UID: "paid"})
@@ -61,7 +70,7 @@ func TestModelCostUnknownBeatsKnownPaid(t *testing.T) {
 	p.NoteModelCost("paid", "hy4-preview", 2.9, 1000)
 
 	for i := 0; i < 50; i++ {
-		a := p.PickExcludingForModel(nil, "hy4-preview")
+		a := p.PickExcludingForRealm(nil, "hy4-preview", "")
 		if a == nil || a.UID != "unknown" {
 			t.Fatalf("选中 %v, want unknown（未知号需有机会被实测）", a)
 		}
@@ -72,6 +81,9 @@ func TestModelCostUnknownBeatsKnownPaid(t *testing.T) {
 func TestModelCostFreeBeatsUnknown(t *testing.T) {
 	withNoPickGap(t)
 	p := New("")
+	// 探索关停前置（issue #136）：本测试锚定「无探索义务时的成本优先语义」，
+	// 层序语义不变，显式关停新增的 costTier 探索维度（设计报告 §4 T9）。
+	p.SetCostExploreInterval(0)
 	p.SetRandomSource(func(n int64) int64 { return 0 })
 	p.Add(&auth.Auth{UID: "knownfree"})
 	p.Add(&auth.Auth{UID: "unknown"})
@@ -80,7 +92,7 @@ func TestModelCostFreeBeatsUnknown(t *testing.T) {
 	p.NoteModelCost("knownfree", "hy4-preview", 0, 1000)
 
 	for i := 0; i < 50; i++ {
-		a := p.PickExcludingForModel(nil, "hy4-preview")
+		a := p.PickExcludingForRealm(nil, "hy4-preview", "")
 		if a == nil || a.UID != "knownfree" {
 			t.Fatalf("选中 %v, want knownfree（已确认免费 > 未知）", a)
 		}
@@ -104,6 +116,37 @@ func TestModelCostStaleIgnored(t *testing.T) {
 	p.mu.RUnlock()
 	if ok {
 		t.Error("过期的成本观测应失效（夜间免费白天不该仍算免费）")
+	}
+}
+
+// TestModelCostPrunedOnPick 过期观测必须被**回收**（不只是被忽略）。
+//
+// 与 TestModelCostStaleIgnored 的区别：那个只断言 modelCostOf 读回 ok=false，
+// 过期条目仍留在 map 里；本测试断言 pick 写锁路径真的把它删掉——否则 modelCost
+// 与 modelCooldowns「map 不无限膨胀」的口径不一致（后者有 pruneExpiredModelCooldowns）。
+func TestModelCostPrunedOnPick(t *testing.T) {
+	p := New("")
+	p.Add(&auth.Auth{UID: "u1"})
+	p.NoteModelCost("u1", "stale-model", 12, 1000)
+
+	p.mu.Lock()
+	if len(p.byUID["u1"].modelCost) != 1 {
+		p.mu.Unlock()
+		t.Fatalf("前置条件不成立：modelCost len=%d want 1", len(p.byUID["u1"].modelCost))
+	}
+	mc := p.byUID["u1"].modelCost["stale-model"]
+	mc.LastSeen = time.Now().Add(-2 * modelCostTTL) // 手工做旧
+	p.byUID["u1"].modelCost["stale-model"] = mc
+	p.mu.Unlock()
+
+	p.Pick("") // pick 写锁路径做惰性回收
+
+	p.mu.RLock()
+	_, still := p.byUID["u1"].modelCost["stale-model"]
+	n := len(p.byUID["u1"].modelCost)
+	p.mu.RUnlock()
+	if still {
+		t.Errorf("过期 modelCost 条目未被回收（map 只增不减），len=%d", n)
 	}
 }
 
@@ -153,7 +196,7 @@ func TestModelCostEmptyModelUnaffected(t *testing.T) {
 	p := New("")
 	p.Add(&auth.Auth{UID: "u1"})
 	p.NoteModelCost("u1", "hy4-preview", 5.0, 1000)
-	if a := p.PickExcludingForModel(nil, ""); a == nil {
+	if a := p.PickExcludingForRealm(nil, "", ""); a == nil {
 		t.Error("空模型名不应被成本分层影响（应仍能选出账号）")
 	}
 }
@@ -163,17 +206,17 @@ func TestModelCostEmptyModelUnaffected(t *testing.T) {
 func TestPickByUIDForModel(t *testing.T) {
 	p := New("")
 	p.Add(&auth.Auth{UID: "u1"})
-	// 触发一次带解析时间的 6004 冷却：softRateModel=hy4-preview，
+	// 触发一次带解析时间的 6004 冷却：modelCooldowns[hy4-preview] 记录，
 	// 该账号对 hy4-preview 冷却、对其他模型豁免（issue #31 语义）。
 	reset := time.Now().Add(time.Hour)
 	p.CooldownSoftForModel("u1", 600*time.Second, reset, "hy4-preview", "6004 model rate limit")
 
 	// 先确认冷却真的落上了（否则后面两个断言是假阳性）。
 	p.mu.RLock()
-	recorded := p.byUID["u1"].softRateModel
+	_, recorded := p.byUID["u1"].modelCooldowns["hy4-preview"]
 	p.mu.RUnlock()
-	if recorded != "hy4-preview" {
-		t.Fatalf("softRateModel=%q want hy4-preview（6004 模型级冷却未记录模型）", recorded)
+	if !recorded {
+		t.Fatalf("modelCooldowns[hy4-preview] 缺失（6004 模型级冷却未记录模型）")
 	}
 
 	if a := p.PickByUIDForModel("u1", "hy4-preview"); a != nil {
