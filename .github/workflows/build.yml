@@ -1,13 +1,18 @@
-# build.yml 定时多架构打包发布 ghcr.io + amd64 离线 tar.gz artifact。
-# 解决 issue #21「建议打包现成 docker 镜像」：NAS/离线环境拉不到 ghcr 时用 artifact。
-# 参考 /tmp/wb2api-build，适配本仓库（workflow 就住在仓库里，无需双 checkout 覆盖 Dockerfile）。
+# build.yml —— 多架构构建并发布到 ghcr.io
+#
+# 设计要点（重要）：
+#   本 workflow 直接 checkout **上游仓库源码** 来构建，而不是构建本 fork 的副本。
+#   原因：GitHub fork 是静态快照，上游推新 commit 后 fork 不会自动跟进。
+#   直接取上游源码，就永远构建最新代码，无需任何 sync 机制。
+#   本 fork 只作为「CI 载体」（上游仓库无法写入 workflow）。
+#
+# 想打补丁时：在下面 "Apply local patches" 步骤里加 patch 逻辑即可。
 name: Build & Publish
 
 on:
   schedule:
     # 每天北京时间 12:23 = UTC 04:23。
-    # 不用整点 04:00：GitHub schedule 在整点高峰排队严重（实测连续三天迟到 5h+，
-    # 2026-09-17 的 04:00 排队被静默丢弃、整天未跑），错峰 23 分降低排队延迟与丢弃率。
+    # 不用整点：GitHub schedule 在整点高峰排队严重，错峰可降低丢弃率。
     - cron: '23 4 * * *'
   workflow_dispatch:
   push:
@@ -17,14 +22,34 @@ permissions:
   contents: read
   packages: write
 
+env:
+  UPSTREAM_REPO: simapaocao/workbuddy2api
+  UPSTREAM_REF: master
+
 jobs:
   build:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout upstream source
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.UPSTREAM_REPO }}
+          ref: ${{ env.UPSTREAM_REF }}
+          path: src
+
+      - name: Record upstream commit
+        id: up
+        run: |
+          cd src
+          echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+          echo "short=$(git rev-parse --short HEAD)" >> "$GITHUB_OUTPUT"
 
       - name: Create config.json for build
-        run: cp config.example.json config.json
+        run: cp src/config.example.json src/config.json
+
+      - name: Apply local patches
+        run: |
+          echo "（当前无本地补丁。如需修改上游代码，在此处打 patch。）"
 
       # setup-qemu 必须在 setup-buildx 之前：buildx 多架构依赖 QEMU 跨平台模拟。
       - name: Set up QEMU
@@ -40,7 +65,7 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      # ghcr 镜像名必须全小写：github.repository 含大写（Sliverkiss/...），需转小写
+      # ghcr 镜像名必须全小写：github.repository 含大写时需转小写。
       - name: Compute image name (lowercase)
         id: image
         run: echo "name=ghcr.io/${GITHUB_REPOSITORY,,}" >> "$GITHUB_OUTPUT"
@@ -48,25 +73,25 @@ jobs:
       - name: Build & push multi-arch
         uses: docker/build-push-action@v6
         with:
-          context: .
+          context: ./src
           platforms: linux/amd64,linux/arm64
           push: true
           tags: |
             ${{ steps.image.outputs.name }}:latest
-            ${{ steps.image.outputs.name }}:${{ github.sha }}
+            ${{ steps.image.outputs.name }}:${{ steps.up.outputs.sha }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
       # 额外导出 amd64 离线 tar.gz：NAS 拉不到 ghcr 时用 artifact 部署。
       - name: Export offline tarball (amd64)
         run: |
-          docker buildx build --platform linux/amd64 --file Dockerfile \
-            --tag wb2api:offline --output type=docker,dest=wb2api-amd64.tar .
+          docker buildx build --platform linux/amd64 --file src/Dockerfile \
+            --tag wb2api:offline --output type=docker,dest=wb2api-amd64.tar src
           gzip -f wb2api-amd64.tar
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: wb2api-amd64
+          name: wb2api-amd64-${{ steps.up.outputs.short }}
           path: wb2api-amd64.tar.gz
           if-no-files-found: error
