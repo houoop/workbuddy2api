@@ -4,28 +4,38 @@
 #   1. 直接 checkout **上游仓库源码** 构建，而不是构建本 fork 的副本。
 #      GitHub fork 是静态快照，上游更新不会自动进来；直接取上游源码
 #      就永远构建最新代码，无需依赖 sync 机制。本 fork 只作 CI 载体。
-#   2. 只构建 linux/amd64（部署机全是 x86_64，省掉 QEMU 跨平台模拟）。
-#   3. 双 tag 发布策略 —— 生产闸门：
-#        latest     —— 每次构建都更新，代表「最新构建产物」。
-#        production —— **只在显式勾选 update_production 时前进**。
-#      Komodo 的 stack 固定引用 production tag，所以日常自动构建
-#      不会影响生产；要上线新版本时手动跑一次并勾选即可。
+#   2. **上游 commit 没变就不构建**：以「ghcr 上是否已有该 commit 的 tag」
+#      为判据。上游有更新才真正跑构建，否则整个 job 秒退，不浪费额度。
+#   3. 只构建 linux/amd64（部署机全是 x86_64，省掉 QEMU 跨平台模拟）。
+#   4. **绝不自动上线**：本 workflow 只产出 <commit-sha> tag，
+#      不推 latest、不碰 production。生产镜像只能由下面的
+#      "Promote to production" 步骤推进，而它只在手动勾选
+#      update_production 时才执行。上游构建失败或只是测试版本时，
+#      生产保持不动 —— 这正是闸门的意义。
 #
-# 手动推进 production（PAT 需 repo scope）：
-#   curl -X POST -H "Authorization: token $PAT" -H "Accept: application/vnd.github+json" \
+# 手动上线某个版本（PAT 需 repo scope）：
+#   1) 先让它构建出来（或本来就有 <sha> tag）
+#   2) 勾选 update_production 触发，把 production 指向该 sha：
+#   curl -X POST -H "Authorization: token ***" -H "Accept: application/vnd.github+json" \
 #     https://api.github.com/repos/houoop/workbuddy2api/actions/workflows/build.yml/dispatches \
 #     -d '{"ref":"master","inputs":{"update_production":"true"}}'
+#   3) 再让 Komodo 部署（本 workflow 不做这一步，见 skill fork-patch-cicd）
 name: Build & Publish
 
 on:
   schedule:
     # 每天北京时间 12:23 = UTC 04:23。
     # 不用整点：GitHub schedule 在整点高峰排队严重，错峰可降低丢弃率。
+    # 注意：这里每天只是「去上游看一眼有没有新 commit」，没更新就不构建。
     - cron: '23 4 * * *'
   workflow_dispatch:
     inputs:
       update_production:
-        description: '把 production tag 指向本次构建（生产环境启用此版本）'
+        description: '构建后把 production tag 指向该版本（生产上线，需人工确认）'
+        type: boolean
+        default: false
+      force_rebuild:
+        description: '强制重建（该 commit 已构建过时也重建，用于修 Dockerfile）'
         type: boolean
         default: false
   push:
@@ -74,49 +84,64 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      # ghcr 镜像名必须全小写：github.repository 含大写时需转小写。
-      # production tag 仅当 update_production=true 时才加入 tag 列表，
-      # 否则本次构建碰不到 production，生产环境不受影响。
-      - name: Compute image tags
-        id: tags
+      # 判据：ghcr 上是否已存在该上游 commit 的 tag。
+      # 存在 => 这个版本已经构建过，没必要重复构建（除非 force_rebuild）。
+      - name: Check whether this upstream commit is already built
+        id: check
         run: |
           NAME="ghcr.io/${GITHUB_REPOSITORY,,}"
-          echo "tags<<TAGS_EOF" >> "$GITHUB_OUTPUT"
-          echo "$NAME:latest" >> "$GITHUB_OUTPUT"
-          echo "$NAME:${{ steps.up.outputs.sha }}" >> "$GITHUB_OUTPUT"
-          if [ "${{ inputs.update_production }}" = "true" ]; then
-            echo "$NAME:production" >> "$GITHUB_OUTPUT"
-          fi
-          echo "TAGS_EOF" >> "$GITHUB_OUTPUT"
-
-      - name: Show tags / production decision
-        run: |
-          echo "本次推送 tags:"
-          echo "${{ steps.tags.outputs.tags }}"
-          if [ "${{ inputs.update_production }}" = "true" ]; then
-            echo ">>> production tag 将被更新（生产环境将部署此版本）"
+          SHA="${{ steps.up.outputs.sha }}"
+          echo "name=$NAME" >> "$GITHUB_OUTPUT"
+          if docker manifest inspect "$NAME:$SHA" >/dev/null 2>&1; then
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+            echo ">>> 上游 commit $SHA 已构建过，跳过重建。"
           else
-            echo ">>> production tag 保持不变（仅更新 latest，生产环境不受影响）"
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+            echo ">>> 上游 commit $SHA 是新版本，开始构建。"
           fi
 
+      - name: Report decision
+        run: |
+          echo "上游 commit : ${{ steps.up.outputs.sha }}"
+          echo "已构建过    : ${{ steps.check.outputs.exists }}"
+          echo "强制重建    : ${{ inputs.force_rebuild }}"
+          echo "推生产      : ${{ inputs.update_production }}"
+
+      # 只有「新 commit」或「显式强制重建」才真正构建并推送 <sha> tag。
+      # 不推 latest：latest 语义模糊，会在生产是否已升级这件事上误导人。
       - name: Build & push
+        if: steps.check.outputs.exists == 'false' || inputs.force_rebuild
         uses: docker/build-push-action@v6
         with:
           context: ./src
           platforms: linux/amd64
           push: true
-          tags: ${{ steps.tags.outputs.tags }}
+          tags: ${{ steps.check.outputs.name }}:${{ steps.up.outputs.sha }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
+      # 生产闸门：仅在手动勾选 update_production 时执行。
+      # 只是把 production 这个 tag 指向本次的 <sha>（imagetools create 只改
+      # 指向、不重新构建），因此对「已构建过的版本」同样适用。
+      - name: Promote to production
+        if: inputs.update_production
+        run: |
+          NAME="${{ steps.check.outputs.name }}"
+          SHA="${{ steps.up.outputs.sha }}"
+          echo "把 production 指向 $NAME:$SHA"
+          docker buildx imagetools create -t "$NAME:production" "$NAME:$SHA"
+          echo ">>> production 已更新。还需在 Komodo 手动部署该 stack 才会生效。"
+
       # 额外导出 amd64 离线 tar.gz：拉不到 ghcr 时用 artifact 部署。
       - name: Export offline tarball (amd64)
+        if: steps.check.outputs.exists == 'false' || inputs.force_rebuild
         run: |
           docker buildx build --platform linux/amd64 --file src/Dockerfile \
             --tag wb2api:offline --output type=docker,dest=wb2api-amd64.tar src
           gzip -f wb2api-amd64.tar
 
       - name: Upload artifact
+        if: steps.check.outputs.exists == 'false' || inputs.force_rebuild
         uses: actions/upload-artifact@v4
         with:
           name: wb2api-amd64-${{ steps.up.outputs.short }}
