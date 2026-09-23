@@ -20,9 +20,6 @@ import (
 	"workbuddy2api/internal/logfmt"
 )
 
-// intlBaseDefault 国际版（www.codebuddy.ai）默认域名，chat 与 billing 同域。
-const intlBaseDefault = "https://www.codebuddy.ai"
-
 // ErrKind 错误分类，pool 据此决定冷却时长。
 type ErrKind int
 
@@ -138,27 +135,6 @@ func (e *Error) Error() string {
 	return fmt.Sprintf("upstream %s (http %d): %s", e.Kind, e.Status, e.Msg)
 }
 
-<<<<<<< HEAD
-// hardMarkers 余额不足关键词（小写比较 + 中文原文比较双通道）。
-//
-// 实测（2026-09）：国内版额度耗尽时返回 **HTTP 429** + body code=14018
-// "额度已用尽，请访问以下链接，购买加量包以获取更多额度"。
-// 该文案含「已」字，早期词表的 "额度用尽" 子串匹配不到，导致被误判为 soft_rate
-// （短冷却），耗尽账号短暂恢复后又进候选池，每次请求都撞一次 429 并污染轮换。
-// 故此处覆盖「已/未/无」等插入字，并显式收录上游业务码 14018。
-var hardMarkers = []string{
-	"insufficient credit", "no credit", "credit exhausted", "out of credit",
-	"quota exceeded", "quota exhaust", "payment required", "credit not enough",
-	"not enough credit",
-	"积分不足", "额度不足", "余额不足", "积分用完", "额度用尽", "没有积分",
-	// 实测文案变体：额度已用尽 / 额度已耗尽 / 额度已用完 等
-	"额度已用尽", "额度已耗尽", "额度已用完", "额度耗尽", "额度用完",
-	"积分已用尽", "积分已耗尽", "余额已用尽",
-	// 上游业务码 14018 = 额度已用尽。用带引号的 JSON 形态精确匹配，
-	// 避免裸子串 "14018" 误伤 requestId/时间戳等偶含该数字的字段。
-	`"code":14018`, `"code": 14018`,
-}
-=======
 // hardRule 余额不足关键词（大小写不敏感 + 中文原文双通道）。
 var hardRule = errorRule{kind: ErrHardCredit, mode: matchFold, patterns: []string{
 	"insufficient credit", "no credit", "credit exhausted", "credits exhausted", "out of credit",
@@ -166,7 +142,6 @@ var hardRule = errorRule{kind: ErrHardCredit, mode: matchFold, patterns: []strin
 	"not enough credit",
 	"积分不足", "额度不足", "余额不足", "积分用完", "额度用尽", "没有积分",
 }}
->>>>>>> upstream-v2
 
 // softRateRule 限流/节流关键词（小写比较 + 中文原文比较双通道）。
 // 上游在状态码非 429 时也会返回限流语义（如 200 + code 11140
@@ -731,11 +706,6 @@ type Client struct {
 
 	ChatBaseCN    string
 	BillingBaseCN string
-<<<<<<< HEAD
-	// ChatBaseIntl / BillingBaseIntl 国际版（www.codebuddy.ai）域名，供 Gmail 等海外账号路由。
-	ChatBaseIntl    string
-	BillingBaseIntl string
-=======
 
 	// ChatBaseGlobal / BillingBaseGlobal 国际版（global realm）上游 base。
 	// 空 = 缺省默认 https://www.workbuddy.ai（D5）。
@@ -746,7 +716,6 @@ type Client struct {
 	// false 即显式逃生门：即使用户 auth 写了 realm=global 也**不**路由到 global base——
 	// chatBase/billingBase 返回 CN base，路径也走 CN（双保险，与 auth.Realm() 的开关闸呼应）。
 	GlobalEnabled bool
->>>>>>> upstream-v2
 }
 
 // New 生产默认值。Transport 由 newTransport() 集中构造（连接层加固：禁 h2 /
@@ -759,8 +728,6 @@ func New() *Client {
 		SanitizeFingerprints: true,
 		ChatBaseCN:           "https://copilot.tencent.com",
 		BillingBaseCN:        "https://www.codebuddy.cn",
-		ChatBaseIntl:         "https://www.codebuddy.ai",
-		BillingBaseIntl:      "https://www.codebuddy.ai",
 	}
 }
 
@@ -772,28 +739,6 @@ func (c *Client) chatHTTP() *http.Client {
 	return c.HTTP
 }
 
-<<<<<<< HEAD
-// IsIntl 报告账号是否为国际版（www.codebuddy.ai），供 server 侧模型感知路由使用。
-func IsIntl(a *auth.Auth) bool { return isIntl(a) }
-
-// isIntl 判断账号是否为国际版（www.codebuddy.ai）。
-// 依据 auth 文件 domain 字段：国际版 OAuth 返回 "www.codebuddy.ai"（或其子域），
-// 国内版返回 "copilot.tencent.com"。兼容旧凭证无 domain 或未知值 → 按国内处理。
-func isIntl(a *auth.Auth) bool {
-	if a == nil {
-		return false
-	}
-	d := strings.ToLower(strings.TrimSpace(a.Domain))
-	return strings.Contains(d, "codebuddy.ai")
-}
-
-func (c *Client) chatBase(a *auth.Auth) string {
-	if isIntl(a) {
-		if c.ChatBaseIntl != "" {
-			return c.ChatBaseIntl
-		}
-		return intlBaseDefault
-=======
 // defaultGlobalBase 缺省 global base（D5：config 未覆盖时默认 workbuddy.ai）。
 const defaultGlobalBase = "https://www.workbuddy.ai"
 
@@ -822,17 +767,11 @@ func (c *Client) globalOn(a *auth.Auth) bool {
 func (c *Client) chatBase(a *auth.Auth) string {
 	if c.globalOn(a) {
 		return c.globalChatBase()
->>>>>>> upstream-v2
 	}
 	return c.ChatBaseCN
 }
 
 // prepareBody 组装出站请求体（脱敏开关由 Client.SanitizeFingerprints 控制）。
-<<<<<<< HEAD
-// intl=true 时额外补全 system prompt（国际版强制首条为 system）。
-func (c *Client) prepareBody(body []byte, intl bool) []byte {
-	return PrepareBodyRealm(body, c.SanitizeFingerprints, c.effortsSnapshot(), intl)
-=======
 // 显式传 realm 使 effort 降级按域取桶：CN 探测信息不得作用到 global 请求（C-2）。
 // conversationID 为网关解析出的会话标识（用于 prompt_cache_key 注入的会话段；
 // body 里自带 conversation_id 时以 body 为准）。uid8 来自账号 UID，是跨账号硬隔离段。
@@ -849,7 +788,6 @@ func (c *Client) prepareBody(body []byte, realm, uid, conversationID string) []b
 	// 让同一客户端对同一账号的连续请求命中上游前缀缓存。
 	body = InjectPromptCacheKey(body, uid, conversationID)
 	return body
->>>>>>> upstream-v2
 }
 
 // effortsSnapshot 返回指定 realm 的 effort 能力缓存副本；该域无探测 → nil（透传不降级）。
@@ -922,16 +860,8 @@ func (c *Client) GlobalEffortSnapshot() (efforts map[string][]string, defaults m
 }
 
 func (c *Client) billingBase(a *auth.Auth) string {
-<<<<<<< HEAD
-	if isIntl(a) {
-		if c.BillingBaseIntl != "" {
-			return c.BillingBaseIntl
-		}
-		return intlBaseDefault
-=======
 	if c.globalOn(a) {
 		return c.globalBillingBase()
->>>>>>> upstream-v2
 	}
 	return c.BillingBaseCN
 }
@@ -1099,38 +1029,6 @@ func (c *Client) RefreshToken(a *auth.Auth) error {
 const chatCompletionsPath = "/v2/chat/completions"
 
 // ChatStream 发 chat 请求并返回原始 SSE body 流（调用方负责 Close）。
-<<<<<<< HEAD
-// 非 2xx 时 rc 为 nil、body 为上游响应体（供调用方 Classify(status, string(body))）、err 为 nil；
-// 只有传输层失败才返回 err。
-func (c *Client) ChatStream(a *auth.Auth, body []byte) (rc io.ReadCloser, status int, respBody []byte, err error) {
-	url := c.chatBase(a) + "/v2/chat/completions"
-	req, err := http.NewRequest(http.MethodPost, url, bytes.NewReader(c.prepareBody(body, isIntl(a))))
-	if err != nil {
-		return nil, 0, nil, err
-	}
-	c.ChatHeaders(req, a)
-	ctx, cancel := context.WithCancel(context.Background())
-	req = req.WithContext(ctx)
-	resp, err := c.chatHTTP().Do(req)
-	if err != nil {
-		cancel()
-		log.Printf("ERR: [upstream] chat_stream uid=%s: transport error: %v", logfmt.UID8(a.UID), err)
-		return nil, 0, nil, err
-	}
-	if resp.StatusCode >= 400 {
-		raw, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
-		resp.Body.Close()
-		cancel()
-		kind := Classify(resp.StatusCode, string(raw))
-		log.Printf("WARN: [upstream] chat_stream uid=%s: upstream %d %s body=%s",
-			logfmt.UID8(a.UID), resp.StatusCode, kind, truncate(string(raw), 200))
-		return nil, resp.StatusCode, raw, nil
-	}
-	// 成功分支：cancel 所有权交给 monitorBody（其 Close 会 cancel）；
-	// IdleTimeout<=0 时 monitorBody 原样返回底流、无人调 cancel——可接受：
-	// ctx 无 deadline 无 goroutine，连接由 resp.Body.Close 正常清理。
-	return monitorBody(resp.Body, c.IdleTimeout, cancel), resp.StatusCode, nil, nil
-=======
 // DeptestOnly: 全库仅 upstream 包测试引用；生产全走 ChatStreamContext
 // （handler 传 r.Context()）。迁 export_test.go 不可行——测试需要真实
 // HTTP 回放走完整 chatPaths/monitorBody 链路，与生产共用同一实现。
@@ -1144,7 +1042,6 @@ func (c *Client) ChatStream(a *auth.Auth, body []byte) (rc io.ReadCloser, status
 // cn：/v2/chat/completions 现状不变。
 func (c *Client) ChatStream(a *auth.Auth, body []byte, clientIP string, meta ChatMeta) (rc io.ReadCloser, status int, respBody []byte, err error) {
 	return c.ChatStreamContext(context.Background(), a, body, clientIP, meta)
->>>>>>> upstream-v2
 }
 
 // ChatStreamContext 同 ChatStream，但从 ctx 派生请求 context：调用方（handler）传入

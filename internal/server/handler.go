@@ -204,20 +204,6 @@ func (h *Handler) status(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-<<<<<<< HEAD
-// 静态 CN 模型表（api-reference §5，动态接口失败时的回退）。
-var staticModelsCN = []map[string]any{
-	{"id": "glm-5.2", "object": "model", "created": 1753600000, "owned_by": "workbuddy", "context_length": 131072},
-	{"id": "glm-5.1", "object": "model", "created": 1753600000, "owned_by": "workbuddy", "context_length": 131072},
-	{"id": "glm-5v-turbo", "object": "model", "created": 1753600000, "owned_by": "workbuddy", "context_length": 131072},
-	{"id": "kimi-k2.7", "object": "model", "created": 1753600000, "owned_by": "workbuddy", "context_length": 131072},
-	{"id": "minimax-m3", "object": "model", "created": 1753600000, "owned_by": "workbuddy", "context_length": 131072},
-	{"id": "hy3", "object": "model", "created": 1753600000, "owned_by": "workbuddy", "context_length": 131072},
-	{"id": "hy3-preview", "object": "model", "created": 1753600000, "owned_by": "workbuddy", "context_length": 131072},
-	{"id": "hy3-preview-agent", "object": "model", "created": 1753600000, "owned_by": "workbuddy", "context_length": 131072},
-	{"id": "deepseek-v4-pro", "object": "model", "created": 1753600000, "owned_by": "workbuddy", "context_length": 131072},
-	{"id": "deepseek-v4-flash", "object": "model", "created": 1753600000, "owned_by": "workbuddy", "context_length": 131072},
-=======
 // countsMapFrom 把 CountsDetailed 五元组编码为 /status realm_totals 的字段对象。
 func countsMapFrom(total, healthy, cooling, disabled, inFlightFull int) map[string]int {
 	return map[string]int{
@@ -226,141 +212,6 @@ func countsMapFrom(total, healthy, cooling, disabled, inFlightFull int) map[stri
 		"cooling":        cooling,
 		"disabled":       disabled,
 		"in_flight_full": inFlightFull,
-	}
->>>>>>> upstream-v2
-}
-
-// 静态 INTL 模型表（www.codebuddy.ai）。
-// 国际版 /console/enterprises/personal/models 恒 500，动态拉取不可用，故静态维护。
-// 清单经实测（2026-09 逐个探测）确认可用；context_length 为保守兜底值。
-var staticModelsIntl = []map[string]any{
-	// OpenAI 系列
-	{"id": "gpt-5.6-sol", "object": "model", "created": 1753600000, "owned_by": "workbuddy", "context_length": 131072},
-	{"id": "gpt-5.6-terra", "object": "model", "created": 1753600000, "owned_by": "workbuddy", "context_length": 131072},
-	{"id": "gpt-5.6-luna", "object": "model", "created": 1753600000, "owned_by": "workbuddy", "context_length": 131072},
-	{"id": "gpt-5.5", "object": "model", "created": 1753600000, "owned_by": "workbuddy", "context_length": 131072},
-	{"id": "gpt-5.4", "object": "model", "created": 1753600000, "owned_by": "workbuddy", "context_length": 131072},
-	{"id": "gpt-5.3-codex", "object": "model", "created": 1753600000, "owned_by": "workbuddy", "context_length": 131072},
-	{"id": "gpt-6-astra", "object": "model", "created": 1753600000, "owned_by": "workbuddy", "context_length": 131072},
-	// Anthropic 系列
-	{"id": "claude-opus-5", "object": "model", "created": 1753600000, "owned_by": "workbuddy", "context_length": 131072},
-	{"id": "claude-opus-4.6", "object": "model", "created": 1753600000, "owned_by": "workbuddy", "context_length": 131072},
-	{"id": "claude-sonnet-4.6", "object": "model", "created": 1753600000, "owned_by": "workbuddy", "context_length": 131072},
-	// Google 系列
-	{"id": "gemini-3.1-pro", "object": "model", "created": 1753600000, "owned_by": "workbuddy", "context_length": 131072},
-	{"id": "gemini-3.5-flash", "object": "model", "created": 1753600000, "owned_by": "workbuddy", "context_length": 131072},
-	{"id": "gemini-3.8-flash", "object": "model", "created": 1753600000, "owned_by": "workbuddy", "context_length": 131072},
-	// 国产（国际版可见但 CN 静态表未覆盖的）
-	{"id": "auto", "object": "model", "created": 1753600000, "owned_by": "workbuddy", "context_length": 131072},
-	{"id": "hy4-preview", "object": "model", "created": 1753600000, "owned_by": "workbuddy", "context_length": 131072},
-	{"id": "deepseek-v3", "object": "model", "created": 1753600000, "owned_by": "workbuddy", "context_length": 131072},
-	{"id": "deepseek-v4.1-flash", "object": "model", "created": 1753600000, "owned_by": "workbuddy", "context_length": 131072},
-	{"id": "glm-5.3", "object": "model", "created": 1753600000, "owned_by": "workbuddy", "context_length": 131072},
-	{"id": "kimi-k3", "object": "model", "created": 1753600000, "owned_by": "workbuddy", "context_length": 131072},
-	{"id": "kimi-k2.6", "object": "model", "created": 1753600000, "owned_by": "workbuddy", "context_length": 131072},
-	{"id": "kimi-k2.5", "object": "model", "created": 1753600000, "owned_by": "workbuddy", "context_length": 131072},
-}
-
-// mergeModelTables 合并多张模型表并按 id 去重（先出现者优先）。
-func mergeModelTables(tables ...[]map[string]any) []map[string]any {
-	seen := make(map[string]struct{})
-	out := make([]map[string]any, 0, 32)
-	for _, t := range tables {
-		for _, m := range t {
-			id, _ := m["id"].(string)
-			if id == "" {
-				continue
-			}
-			if _, dup := seen[id]; dup {
-				continue
-			}
-			seen[id] = struct{}{}
-			out = append(out, m)
-		}
-	}
-	return out
-}
-
-// staticModelsAll 全部静态模型（CN ∪ INTL，去重）。
-var staticModelsAll = mergeModelTables(staticModelsCN, staticModelsIntl)
-
-// intlOnlyModels 仅国际版可用的模型集合（国内账号请求会吃 400 "not available for authorized users"）。
-// 用于模型感知路由：命中即优先选国际账号，避免先撞国内号再换号的无谓往返。
-var intlOnlyModels = func() map[string]struct{} {
-	m := make(map[string]struct{})
-	for _, id := range []string{
-		"gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna", "gpt-5.5", "gpt-5.4",
-		"gpt-5.3-codex", "gpt-6-astra",
-		"claude-opus-5", "claude-opus-4.6", "claude-sonnet-4.6",
-		"gemini-3.1-pro", "gemini-3.5-flash", "gemini-3.8-flash",
-		"deepseek-v3", "kimi-k3", "kimi-k2.5",
-	} {
-		m[id] = struct{}{}
-	}
-	return m
-}()
-
-// cnOnlyModels 仅国内版可用的模型集合（国际账号请求会吃 "service info not found"）。
-var cnOnlyModels = func() map[string]struct{} {
-	m := make(map[string]struct{})
-	for _, id := range []string{
-		"deepseek-v4-pro", "deepseek-v4-flash",
-		"glm-5.3-flash", "kimi-k3-1", "hy3-x",
-		"hy3-preview", "hy3-preview-agent",
-	} {
-		m[id] = struct{}{}
-	}
-	return m
-}()
-
-// cnStrictModels 严格绑定国内账号的模型集合：即使国内号全忙/冷却，也不允许溢出到国际号。
-//
-// 动机（实测 2026-09）：国际号额度稀缺（总额 380，约为国内号 1/6）且经代理延迟高
-// （TTFB 常达 20-40s，国内号仅 2-4s）。混元系（hy*）与国产模型本就是国内版主力，
-// 若归在「共有→优先国内」，国内号冷却时会放宽到全池，把流量溢到国际号白烧额度
-// （实测 12 小时 67 次 hy4-preview 跑在国际号上，白烧 312 积分）。
-// 这些模型宁可等国内号，也不要烧国际号。
-var cnStrictModels = func() map[string]struct{} {
-	m := make(map[string]struct{})
-	for _, id := range []string{
-		"hy4-preview", "hy3", "hy3-x", "hy3-preview", "hy3-preview-agent",
-		"glm-5.3", "glm-5.2", "glm-5.1", "glm-5v-turbo", "glm-5.3-flash",
-		"deepseek-v4-pro", "deepseek-v4-flash", "deepseek-v4.1-flash",
-		"kimi-k3-1", "kimi-k2.7", "kimi-k2.6",
-		"minimax-m3",
-	} {
-		m[id] = struct{}{}
-	}
-	return m
-}()
-
-// modelRealmPrefer 按请求模型返回账号偏好过滤函数，实现模型感知路由。
-//
-//	仅国际模型 → 只选国际账号
-//	仅国内模型 → 只选国内账号
-//	共有/未知模型 → 优先国内账号（省代理流量、延迟更低）
-//
-// 返回 (prefer, strict)。prefer 为 nil 表示不做限制（全池随机）。
-// strict=true 时 pool 不放宽到全池，域内无候选即返回 nil（调用方回 503）。
-// 注：非严格模式下的可用性由 pool 侧兜底——偏好集合无 healthy 候选时自动放宽到全池。
-func modelRealmPrefer(model string) (func(*auth.Auth) bool, bool) {
-	if model == "" {
-		return nil, false
-	}
-	notIntl := func(a *auth.Auth) bool { return !upstream.IsIntl(a) }
-	_, intlOnly := intlOnlyModels[model]
-	_, strictCN := cnStrictModels[model]
-	_, cnOnly := cnOnlyModels[model]
-	switch {
-	case intlOnly:
-		return upstream.IsIntl, false
-	case strictCN:
-		return notIntl, true
-	case cnOnly:
-		return notIntl, false
-	default:
-		// 共有或未收录模型：优先国内账号（可放宽）。
-		return notIntl, false
 	}
 }
 
@@ -458,21 +309,6 @@ func applyModelInfoFields(entry map[string]any, mi upstream.ModelInfo) map[strin
 }
 
 // modelList 动态获取模型列表并包装成 OpenAI 格式（含 context_length）。
-<<<<<<< HEAD
-// 动态拉取成功 → 动态表 ∪ INTL 静态表（国际版模型端点不可用，需静态补全）；
-// 动态拉取失败 → CN ∪ INTL 静态表，保证 /v1/models 始终反映可用模型。
-func (h *Handler) modelList() []map[string]any {
-	if infos := h.fetchDynamicModels(); len(infos) > 0 {
-		out := make([]map[string]any, 0, len(infos)+len(staticModelsIntl))
-		for _, mi := range infos {
-			entry := map[string]any{
-				"id":                mi.ID,
-				"object":            "model",
-				"created":           1753600000,
-				"owned_by":          "workbuddy",
-				"context_length":    mi.ContextWindow,
-				"max_output_tokens": mi.MaxTokens,
-=======
 // CN 模型输出统一加 "cn:" 前缀（gateway 路由协议，与 resolveModel 对称）。
 // 纯动态：动态拉取失败/无号 → 该域空列表，无静态兜底；
 // global.enabled=false（显式逃生门）时只列 CN（global 名单不出现）。
@@ -503,7 +339,6 @@ func (h *Handler) modelList() []map[string]any {
 			entry["reasoning_supported_efforts"] = efforts
 			if def != "" {
 				entry["reasoning_default_effort"] = def
->>>>>>> upstream-v2
 			}
 		}
 		out = append(out, entry)
@@ -551,14 +386,8 @@ func (h *Handler) modelList() []map[string]any {
 			}
 			out = append(out, entry)
 		}
-<<<<<<< HEAD
-		return mergeModelTables(out, staticModelsIntl)
-	}
-	return staticModelsAll
-=======
 	}
 	return out
->>>>>>> upstream-v2
 }
 
 // fetchGlobalModels 返回 global 模型名单（纯动态探测结果）及被探测账号。
@@ -618,29 +447,15 @@ func (h *Handler) fetchDynamicModels() []upstream.ModelInfo {
 	}
 	dynamicModelsCache.RUnlock()
 
-<<<<<<< HEAD
-	// 模型列表端点仅国内版可用（国际版 /console/enterprises/personal/models 恒 500），
-	// 故此处偏好国内账号；全为国际版时才回落（pool 侧自动放宽）。
-	acct := h.cfg.Pool.PickPrefer(nil, func(a *auth.Auth) bool { return !upstream.IsIntl(a) }, false)
-=======
 	acct := h.cfg.Pool.PickExcludingForRealm(nil, "", "cn")
->>>>>>> upstream-v2
 	if acct == nil {
 		return nil
 	}
-	// 国际版账号的 models 端点不可用，失败不惩罚该账号（非账号问题，避免误喂熔断计数）。
-	intlAcct := upstream.IsIntl(acct)
 	infos, err := h.cfg.Upstream.FetchModels(acct)
 	if err != nil || len(infos) == 0 {
-<<<<<<< HEAD
-		if !intlAcct {
-			h.cfg.Pool.NoteError(acct.UID)
-		}
-=======
 		// 拉取失败只进负缓存（5min lastFail），不 NoteError（P1-6/发现 6）：
 		// NoteError 喂的是 chat 熔断器，models 端点偶发 5xx 跨界惩罚 chat 通道
 		// 健康的账号；models 拉取失败 ≠ 账号 chat 不可用。
->>>>>>> upstream-v2
 		dynamicModelsCache.Lock()
 		dynamicModelsCache.lastFail = time.Now()
 		dynamicModelsCache.Unlock()
@@ -777,12 +592,6 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		degradedApplied = true
 	}
 
-<<<<<<< HEAD
-	// 模型感知路由：按请求模型决定账号偏好（国际专属模型 → 国际号；共有/国内模型 → 国内号）。
-	// pool 侧兜底：偏好集合无 healthy 候选时自动放宽到全池，故此处只影响优先级，不影响可用性。
-	reqModel := parseModelFromBody(body)
-	realmPrefer, realmStrict := modelRealmPrefer(reqModel)
-=======
 	// outbound model 名重写为 bareModel（D6）：realm 前缀是网关侧路由协议，
 	// 上游不认前缀（global 账号也请求裸模型名）。裸名时 bareModel==peek.Model 恒等。
 	if bareModel != peek.Model {
@@ -826,44 +635,21 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		chatMeta.ConversationRequestID = session.TurnRequestID("")
 	}
 	chatMeta.TraceID = r.Header.Get("X-Trace-ID")
->>>>>>> upstream-v2
 
 	for i := 0; i < h.cfg.MaxRotate; i++ {
 		// 选号：粘性号优先（PickByUIDForModel 已校验该模型可用性 + 在途未满），否则普通轮换。
 		var acct *auth.Auth
 		if stickyUID != "" {
-<<<<<<< HEAD
-			acct = h.cfg.Pool.PickByUIDForModel(stickyUID, peek.Model)
-			if acct != nil && realmPrefer != nil && !realmPrefer(acct) {
-				// 粘性号与本次请求的账号域不匹配（如国际专属模型绑到了国内号）：
-				// 释放并解绑，改走带域偏好的轮换，避免必失败的一次往返。
-				h.cfg.Pool.Release(acct.UID)
-				h.cfg.Session.Unbind(sessKey)
-				stickyUID = ""
-				acct = nil
-			}
-			if acct == nil {
-				// 粘性号在当前模型不可用（冷却/占满/该模型被 6004 限额）→ 解绑，本次回落普通轮换。
-=======
 			acct = h.cfg.Pool.PickByUIDForModel(stickyUID, bareModel)
 			if acct == nil || (realm != "" && acct.Realm() != realm) {
 				// 粘性号在当前模型不可用（冷却/占满/该模型被 6004 限额）或 realm 不符 → 解绑。
->>>>>>> upstream-v2
 				unbindSticky()
 			}
 		}
 		if acct == nil {
-<<<<<<< HEAD
-			// 模型感知选号：同时叠加两层约束——
-			//  1. 上游的 6004 模型级冷却豁免（reqModel 非空时走 healthyForModel）
-			//  2. 本项目的账号域偏好（国际专属模型只挑国际号；国产模型严格绑国内号）
-			// 域偏好为 nil（未知模型）时等价于纯上游行为。
-			acct = h.cfg.Pool.PickExcludingForModelPrefer(tried, peek.Model, realmPrefer, realmStrict)
-=======
 			// 模型感知 + realm 感知选号：模型非空时启用 6004 模型级冷却豁免
 			// （healthyForModel），realm 谓词过滤跨域账号。
 			acct = h.cfg.Pool.PickExcludingForRealm(tried, bareModel, realm)
->>>>>>> upstream-v2
 		}
 		if acct == nil {
 			st.status = http.StatusServiceUnavailable

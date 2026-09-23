@@ -13,11 +13,6 @@ import (
 )
 
 const (
-<<<<<<< HEAD
-	clientUA          = "CLI/2.63.2 CodeBuddy/2.63.2"
-	originRefererCN   = "https://www.codebuddy.cn"
-	originRefererIntl = "https://www.codebuddy.ai"
-=======
 	// defaultClientVersion 出站 WorkBuddy 客户端版本段（UA 的 `WorkBuddy/<ver>` 与
 	// 白名单头组的 X-IDE-Version）。对齐官方 WorkBuddy Desktop 分发包版本
 	// （/tmp/wb-ua-fp/step1-fingerprint.md §1.2：WORKBUDDY_CLIENT_VERSION = 桌面端
@@ -32,19 +27,13 @@ const (
 
 	originRefererCN     = "https://www.codebuddy.cn"
 	originRefererGlobal = "https://www.workbuddy.ai"
->>>>>>> upstream-v2
 )
 
 // originRefererFor 按账号 realm 返回 Origin/Referer 基础域：
 // global → https://www.workbuddy.ai；cn（含全局开关未开）→ https://www.codebuddy.cn。
 func originRefererFor(a *auth.Auth) string {
-<<<<<<< HEAD
-	if isIntl(a) {
-		return originRefererIntl
-=======
 	if a != nil && a.IsGlobal() {
 		return originRefererGlobal
->>>>>>> upstream-v2
 	}
 	return originRefererCN
 }

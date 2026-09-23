@@ -19,36 +19,12 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
-<<<<<<< HEAD
-	"path/filepath"
-	"sort"
-	"strings"
-=======
->>>>>>> upstream-v2
 	"time"
 
 	"workbuddy2api/internal/auth"
 	"workbuddy2api/internal/upstream"
 )
 
-<<<<<<< HEAD
-const billingBaseCN = "https://www.codebuddy.cn"
-const billingBaseIntl = "https://www.codebuddy.ai"
-
-type authFile struct {
-	Auth struct {
-		AccessToken string `json:"accessToken"`
-		Domain      string `json:"domain"`
-	} `json:"auth"`
-	Account struct {
-		UID          string `json:"uid"`
-		EnterpriseID string `json:"enterpriseId"`
-		Nickname     string `json:"nickname"`
-	} `json:"account"`
-}
-
-=======
->>>>>>> upstream-v2
 type accountResult struct {
 	UID      string `json:"uid"`
 	Nickname string `json:"nickname"`
@@ -60,130 +36,6 @@ type accountResult struct {
 	Error    string `json:"error,omitempty"`
 }
 
-<<<<<<< HEAD
-type resourcePackage struct {
-	CapacityRemain      int64 `json:"CapacityRemain"`
-	CapacityUsed        int64 `json:"CapacityUsed"`
-	CapacitySize        int64 `json:"CapacitySize"`
-	CycleCapacityRemain int64 `json:"CycleCapacityRemain"`
-	CycleCapacityUsed   int64 `json:"CycleCapacityUsed"`
-	CycleCapacitySize   int64 `json:"CycleCapacitySize"`
-}
-
-// packageRemainUsed 与 billing.go:203-258 一致
-func packageRemainUsed(a resourcePackage) (remain, used, size int64) {
-	if a.CycleCapacitySize > 0 {
-		remain = a.CycleCapacityRemain
-		size = a.CycleCapacitySize
-		if remain < 0 {
-			remain = 0
-		}
-		if remain > size {
-			remain = size
-		}
-		used = size - remain
-		if a.CycleCapacityUsed > used {
-			used = a.CycleCapacityUsed
-			if size >= used {
-				remain = size - used
-			}
-		}
-		return remain, used, size
-	}
-	remain = a.CapacityRemain
-	used = a.CapacityUsed
-	size = a.CapacitySize
-	if used == 0 && size > remain {
-		used = size - remain
-	}
-	return remain, used, size
-}
-
-// billingBaseFor 按账号 domain 选择国内/国际版计费域名。
-func billingBaseFor(af *authFile) string {
-	if strings.Contains(strings.ToLower(af.Auth.Domain), "codebuddy.ai") {
-		return billingBaseIntl
-	}
-	return billingBaseCN
-}
-
-func fetchUserResource(af *authFile) (remain, used, size int64, packs int, err error) {
-	now := time.Now()
-	body, _ := json.Marshal(map[string]any{
-		"PageNumber":               1,
-		"PageSize":                 100,
-		"ProductCode":              "p_tcaca",
-		"Status":                   []int{0, 3},
-		"PackageEndTimeRangeBegin": now.Format("2006-01-02 15:04:05"),
-		"PackageEndTimeRangeEnd":   now.Add(365 * 101 * 24 * time.Hour).Format("2006-01-02 15:04:05"),
-	})
-	req, err := http.NewRequest(http.MethodPost, billingBaseFor(af)+"/v2/billing/meter/get-user-resource", bytes.NewReader(body))
-	if err != nil {
-		return 0, 0, 0, 0, err
-	}
-	req.Header.Set("Authorization", "Bearer "+af.Auth.AccessToken)
-	req.Header.Set("Accept", "application/json")
-	req.Header.Set("Content-Type", "application/json")
-	if af.Account.UID != "" {
-		req.Header.Set("X-User-Id", af.Account.UID)
-	}
-	if af.Account.EnterpriseID != "" {
-		req.Header.Set("X-Enterprise-Id", af.Account.EnterpriseID)
-		req.Header.Set("X-Tenant-Id", af.Account.EnterpriseID)
-	}
-	if af.Auth.Domain != "" {
-		req.Header.Set("X-Domain", af.Auth.Domain)
-	}
-	client := &http.Client{Timeout: 20 * time.Second}
-	resp, err := client.Do(req)
-	if err != nil {
-		return 0, 0, 0, 0, err
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode >= 400 {
-		return 0, 0, 0, 0, fmt.Errorf("http %d", resp.StatusCode)
-	}
-	var env struct {
-		Code int    `json:"code"`
-		Msg  string `json:"msg"`
-		Data struct {
-			Response struct {
-				Data struct {
-					TotalDosage int64             `json:"TotalDosage"`
-					Accounts    []resourcePackage `json:"Accounts"`
-				} `json:"Data"`
-			} `json:"Response"`
-		} `json:"data"`
-	}
-	if err := json.NewDecoder(resp.Body).Decode(&env); err != nil {
-		return 0, 0, 0, 0, err
-	}
-	if env.Code != 0 {
-		return 0, 0, 0, 0, fmt.Errorf("code=%d %s", env.Code, env.Msg)
-	}
-	for _, a := range env.Data.Response.Data.Accounts {
-		r, u, s := packageRemainUsed(a)
-		remain += r
-		used += u
-		size += s
-	}
-	packs = len(env.Data.Response.Data.Accounts)
-	if size > 0 {
-		if derived := size - remain; derived > used {
-			used = derived
-		}
-	}
-	if dosage := env.Data.Response.Data.TotalDosage; dosage > size {
-		size = dosage
-		if derived := size - remain; derived > used {
-			used = derived
-		}
-	}
-	return remain, used, size, packs, nil
-}
-
-=======
->>>>>>> upstream-v2
 func main() {
 	pretty := len(os.Args) > 1 && os.Args[1] == "-pretty"
 	authDir := "./auths"

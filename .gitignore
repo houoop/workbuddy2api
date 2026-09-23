@@ -17,9 +17,6 @@ data/
 /wb2api.exe
 /signin_bin.exe
 
-# 预编译产物目录（10.8.0.12 构建机产出，Dockerfile 直接 COPY）
-.build-dist/
-
 # Config with secrets (use config.example.json)
 config.json
 
@@ -50,5 +47,3 @@ docs/
 # 设计/计划文档（但 README.md 必须进版本库）
 *.md
 !README.md
-.narrafork/
-.worktrees/

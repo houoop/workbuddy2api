@@ -1,10 +1,5 @@
 # syntax=docker/dockerfile:1
-<<<<<<< HEAD
-FROM golang:1.23-alpine AS build
-# GOPROXY 指向国内镜像：直连 proxy.golang.org 在部分网络环境下会超时。
-=======
 FROM golang:1.26-alpine AS build
->>>>>>> upstream-v2
 ENV GOPROXY=https://goproxy.cn,direct
 WORKDIR /src
 COPY go.mod ./
@@ -31,11 +26,6 @@ COPY --from=build /out/wb2api /app/wb2api
 COPY --from=build /out/signin_bin /app/signin_bin
 COPY --from=build /out/login /app/login
 COPY --from=build /out/credit /app/credit
-<<<<<<< HEAD
-COPY login.sh signin.sh credit.sh /app/
-COPY scripts/task_runner.py scripts/task_common.py /app/scripts/
-RUN sed -i 's/\r$//' /app/login.sh /app/signin.sh /app/credit.sh && chmod 755 /app/login.sh /app/signin.sh /app/credit.sh
-=======
 COPY --from=build /out/trial_bin /app/trial_bin
 COPY --from=build /out/activity_bin /app/activity_bin
 COPY login.sh signin.sh credit.sh trial.sh /app/
@@ -46,7 +36,6 @@ COPY scripts/task_runner.py /app/scripts/task_runner.py
 COPY scripts/school_open_day_2026.py /app/scripts/school_open_day_2026.py
 RUN sed -i 's/\r$//' /app/*.sh && chmod 755 /app/*.sh
 RUN sed -i 's/\r$//' /app/scripts/*.py && chmod 755 /app/scripts/*.py
->>>>>>> upstream-v2
 # 镜像不带真实配置：落 example 作为默认（生产由挂载卷 /app/config.json 覆盖）
 COPY config.example.json /app/config.json
 USER app

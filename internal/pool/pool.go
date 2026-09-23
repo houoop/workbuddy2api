@@ -307,7 +307,3 @@ func (p *Pool) upsertLocked(a *auth.Auth) {
 	}
 	p.byUID[a.UID] = &entry{a: a}
 }
-<<<<<<< HEAD
-
-=======
->>>>>>> upstream-v2

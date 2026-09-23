@@ -192,74 +192,6 @@ func TestPrepareBodyOptWithEfforts(t *testing.T) {
 	}
 }
 
-<<<<<<< HEAD
-// TestNormalizeSystemPrompt 覆盖首条 system 补全（国际版 11128 修复）。
-func TestNormalizeSystemPrompt(t *testing.T) {
-	cases := []struct {
-		name      string
-		in        string
-		wantFirst string // 期望首条 role；"" 表示不校验
-		wantLen   int    // 期望消息条数
-	}{
-		{
-			name:      "no system -> inject",
-			in:        `{"messages":[{"role":"user","content":"hi"}]}`,
-			wantFirst: "system",
-			wantLen:   2,
-		},
-		{
-			name:      "has system -> keep as-is",
-			in:        `{"messages":[{"role":"system","content":"custom"},{"role":"user","content":"hi"}]}`,
-			wantFirst: "system",
-			wantLen:   2,
-		},
-		{
-			name:      "system in middle -> inject at head",
-			in:        `{"messages":[{"role":"user","content":"hi"},{"role":"system","content":"late"}]}`,
-			wantFirst: "system",
-			wantLen:   3,
-		},
-		{
-			name:      "assistant first -> inject",
-			in:        `{"messages":[{"role":"assistant","content":"hi"}]}`,
-			wantFirst: "system",
-			wantLen:   2,
-		},
-		{
-			name:      "empty messages -> untouched",
-			in:        `{"messages":[]}`,
-			wantFirst: "",
-			wantLen:   0,
-		},
-		{
-			name:      "no messages key -> untouched",
-			in:        `{"model":"x"}`,
-			wantFirst: "",
-			wantLen:   0,
-		},
-	}
-	for _, c := range cases {
-		t.Run(c.name, func(t *testing.T) {
-			out := PrepareBodyRealm([]byte(c.in), false, nil, true)
-			var m map[string]any
-			if err := json.Unmarshal(out, &m); err != nil {
-				t.Fatalf("unmarshal: %v", err)
-			}
-			msgs, ok := m["messages"].([]any)
-			if !ok {
-				if c.wantLen == 0 {
-					return
-				}
-				t.Fatalf("messages missing: %s", out)
-			}
-			if len(msgs) != c.wantLen {
-				t.Fatalf("msgs len=%d want %d: %s", len(msgs), c.wantLen, out)
-			}
-			if c.wantFirst != "" {
-				first := msgs[0].(map[string]any)
-				if role, _ := first["role"].(string); role != c.wantFirst {
-					t.Errorf("first role=%q want %q", role, c.wantFirst)
-=======
 // TestNormalizeImageURL 覆盖 OpenAI chat 多模态内容的 image_url 兼容：
 // 字符串形态必须转为上游需要的对象形态；对象形态及其中字段必须原样保留；
 // 无效输入不补默认值，继续交给上游返回真实错误。
@@ -330,46 +262,8 @@ func TestNormalizeImageURL(t *testing.T) {
 				}
 				if got := part["image_url"]; !reflect.DeepEqual(got, tc.want) {
 					t.Errorf("sanitize=%v: image_url=%#v want %#v", sanitize, got, tc.want)
->>>>>>> upstream-v2
 				}
 			}
 		})
 	}
 }
-<<<<<<< HEAD
-
-// TestNormalizeSystemPromptKeepsOriginalContent 确认补全不篡改原有消息。
-func TestNormalizeSystemPromptKeepsOriginalContent(t *testing.T) {
-	in := `{"messages":[{"role":"user","content":"原始内容"}]}`
-	out := PrepareBodyRealm([]byte(in), false, nil, true)
-	var m map[string]any
-	json.Unmarshal(out, &m)
-	msgs := m["messages"].([]any)
-	if len(msgs) != 2 {
-		t.Fatalf("want 2 msgs, got %d", len(msgs))
-	}
-	second := msgs[1].(map[string]any)
-	if second["content"] != "原始内容" || second["role"] != "user" {
-		t.Errorf("original message altered: %v", second)
-	}
-}
-
-// TestPrepareBodyRealmCNNoSystemInjection 国内域（intl=false）不得注入 system，
-// 保持既有 CN 请求形状逐字不变（避免行为漂移与多余 token）。
-func TestPrepareBodyRealmCNNoSystemInjection(t *testing.T) {
-	in := `{"messages":[{"role":"user","content":"hi"}]}`
-	out := PrepareBodyRealm([]byte(in), false, nil, false)
-	var m map[string]any
-	if err := json.Unmarshal(out, &m); err != nil {
-		t.Fatalf("unmarshal: %v", err)
-	}
-	msgs := m["messages"].([]any)
-	if len(msgs) != 1 {
-		t.Fatalf("CN realm must not inject system, got %d msgs: %s", len(msgs), out)
-	}
-	if role := msgs[0].(map[string]any)["role"]; role != "user" {
-		t.Errorf("first role=%v want user", role)
-	}
-}
-=======
->>>>>>> upstream-v2
