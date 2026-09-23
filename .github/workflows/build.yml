@@ -1,12 +1,20 @@
-# build.yml —— 构建并发布到 ghcr.io
+# build.yml —— 构建 API 并发布到 ghcr.io
 #
-# 设计要点（重要）：
-#   本 workflow 直接 checkout **上游仓库源码** 来构建，而不是构建本 fork 的副本。
-#   原因：GitHub fork 是静态快照，上游推新 commit 后 fork 不会自动跟进。
-#   直接取上游源码，就永远构建最新代码，无需任何 sync 机制。
-#   本 fork 只作为「CI 载体」（上游仓库无法写入 workflow）。
+# 设计要点：
+#   1. 直接 checkout **上游仓库源码** 构建，而不是构建本 fork 的副本。
+#      GitHub fork 是静态快照，上游更新不会自动进来；直接取上游源码
+#      就永远构建最新代码，无需依赖 sync 机制。本 fork 只作 CI 载体。
+#   2. 只构建 linux/amd64（部署机全是 x86_64，省掉 QEMU 跨平台模拟）。
+#   3. 双 tag 发布策略 —— 生产闸门：
+#        latest     —— 每次构建都更新，代表「最新构建产物」。
+#        production —— **只在显式勾选 update_production 时前进**。
+#      Komodo 的 stack 固定引用 production tag，所以日常自动构建
+#      不会影响生产；要上线新版本时手动跑一次并勾选即可。
 #
-# 想打补丁时：在下面 "Apply local patches" 步骤里加 patch 逻辑即可。
+# 手动推进 production（PAT 需 repo scope）：
+#   curl -X POST -H "Authorization: token $PAT" -H "Accept: application/vnd.github+json" \
+#     https://api.github.com/repos/houoop/workbuddy2api/actions/workflows/build.yml/dispatches \
+#     -d '{"ref":"master","inputs":{"update_production":"true"}}'
 name: Build & Publish
 
 on:
@@ -15,8 +23,13 @@ on:
     # 不用整点：GitHub schedule 在整点高峰排队严重，错峰可降低丢弃率。
     - cron: '23 4 * * *'
   workflow_dispatch:
+    inputs:
+      update_production:
+        description: '把 production tag 指向本次构建（生产环境启用此版本）'
+        type: boolean
+        default: false
   push:
-    tags: ['v*'] # 打 tag 也触发发布
+    tags: ['v*']
 
 permissions:
   contents: read
@@ -51,7 +64,6 @@ jobs:
         run: |
           echo "（当前无本地补丁。如需修改上游代码，在此处打 patch。）"
 
-
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
@@ -63,9 +75,29 @@ jobs:
           password: ${{ secrets.GITHUB_TOKEN }}
 
       # ghcr 镜像名必须全小写：github.repository 含大写时需转小写。
-      - name: Compute image name (lowercase)
-        id: image
-        run: echo "name=ghcr.io/${GITHUB_REPOSITORY,,}" >> "$GITHUB_OUTPUT"
+      # production tag 仅当 update_production=true 时才加入 tag 列表，
+      # 否则本次构建碰不到 production，生产环境不受影响。
+      - name: Compute image tags
+        id: tags
+        run: |
+          NAME="ghcr.io/${GITHUB_REPOSITORY,,}"
+          echo "tags<<TAGS_EOF" >> "$GITHUB_OUTPUT"
+          echo "$NAME:latest" >> "$GITHUB_OUTPUT"
+          echo "$NAME:${{ steps.up.outputs.sha }}" >> "$GITHUB_OUTPUT"
+          if [ "${{ inputs.update_production }}" = "true" ]; then
+            echo "$NAME:production" >> "$GITHUB_OUTPUT"
+          fi
+          echo "TAGS_EOF" >> "$GITHUB_OUTPUT"
+
+      - name: Show tags / production decision
+        run: |
+          echo "本次推送 tags:"
+          echo "${{ steps.tags.outputs.tags }}"
+          if [ "${{ inputs.update_production }}" = "true" ]; then
+            echo ">>> production tag 将被更新（生产环境将部署此版本）"
+          else
+            echo ">>> production tag 保持不变（仅更新 latest，生产环境不受影响）"
+          fi
 
       - name: Build & push
         uses: docker/build-push-action@v6
@@ -73,13 +105,11 @@ jobs:
           context: ./src
           platforms: linux/amd64
           push: true
-          tags: |
-            ${{ steps.image.outputs.name }}:latest
-            ${{ steps.image.outputs.name }}:${{ steps.up.outputs.sha }}
+          tags: ${{ steps.tags.outputs.tags }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
-      # 额外导出 amd64 离线 tar.gz：NAS 拉不到 ghcr 时用 artifact 部署。
+      # 额外导出 amd64 离线 tar.gz：拉不到 ghcr 时用 artifact 部署。
       - name: Export offline tarball (amd64)
         run: |
           docker buildx build --platform linux/amd64 --file src/Dockerfile \
