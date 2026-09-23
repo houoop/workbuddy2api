@@ -1,4 +1,4 @@
-# build.yml —— 多架构构建并发布到 ghcr.io
+# build.yml —— 构建并发布到 ghcr.io
 #
 # 设计要点（重要）：
 #   本 workflow 直接 checkout **上游仓库源码** 来构建，而不是构建本 fork 的副本。
@@ -51,9 +51,6 @@ jobs:
         run: |
           echo "（当前无本地补丁。如需修改上游代码，在此处打 patch。）"
 
-      # setup-qemu 必须在 setup-buildx 之前：buildx 多架构依赖 QEMU 跨平台模拟。
-      - name: Set up QEMU
-        uses: docker/setup-qemu-action@v3
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
@@ -70,11 +67,11 @@ jobs:
         id: image
         run: echo "name=ghcr.io/${GITHUB_REPOSITORY,,}" >> "$GITHUB_OUTPUT"
 
-      - name: Build & push multi-arch
+      - name: Build & push
         uses: docker/build-push-action@v6
         with:
           context: ./src
-          platforms: linux/amd64,linux/arm64
+          platforms: linux/amd64
           push: true
           tags: |
             ${{ steps.image.outputs.name }}:latest
